@@ -1,0 +1,37 @@
+# Scan output
+*.sarif.json
+*.sarif
+scan_*.json
+results.sarif
+report.html
+report.csv
+
+# Local scan state
+scans/
+.gravion_sniper/
+.gravionignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Build
+build/
+dist/
+*.egg
