@@ -1,0 +1,59 @@
+            if entry == value or entry == hash_secret(value):
+                entries.discard(entry)
+                found = True
+        save_allowlist(entries)
+        print(f"{G}v{X} Removed" if found else f"{Y}Not in allowlist{X}")
+
+    footer()
+
+
+def cmd_verify(args: argparse.Namespace) -> None:
+    """Re-scan a saved target and live-check the credentials it contains.
+
+    Raw secret values are never written to disk, so verification re-reads
+    the original target instead of trusting the stored (redacted) report.
+    """
+    report = load_report(args.name)
+    if report is None:
+        print(f"{R}Scan not found: {args.name}{X}")
+        return
+
+    target = report.get("target", "")
+    options = report.get("options", {})
+    if not target or target == "<stdin>":
+        print(f"{Y}! Target '{target}' cannot be re-read; "
+              f"run 'scan <target> --verify' instead.{X}")
+        footer()
+        return
+
+    print(f"\n{C}>> Re-scanning {target} for live verification{X}\n")
+    fresh = _run_scan(
+        target=target,
+        history=report.get("history", False),
+        threads=options.get("threads", 8),
+        max_size_mb=options.get("max_size_mb", 5),
+        only=options.get("only"),
+        min_severity=options.get("min_severity", "LOW"),
+        no_entropy=options.get("no_entropy", False),
+        no_redact=False,
+        allowlist=load_allowlist(),
+        max_commits=0,
+        name=report.get("name"),
+        verbose=True,
+        decode_encoded=options.get("decode_encoded", True),
+        follow_archives=options.get("follow_archives", True),
+        min_entropy=options.get("min_entropy", 4.2),
+    )
+    if not fresh:
+        footer()
+        return
+
+    print(f"\n{C}>> Verifying {len(fresh.get('findings', []))} findings{X}")
+    fresh["findings"] = verify_findings(fresh.get("findings", []))
+    fresh["summary"] = _build_summary(fresh["findings"])
+    _save_report(fresh)
+    render_report(fresh, show_all=False)
+    footer()
+
+
+# ══════════════
