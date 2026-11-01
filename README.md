@@ -111,6 +111,13 @@ python gravion_secret_sniper.py scan . -e sarif -o results.sarif
     sarif_file: results.sarif
 ```
 
+> **Turn on CI for this repository in one edit.** The complete workflow is committed as
+> [`.github/secret-scan.workflow.yml`](.github/secret-scan.workflow.yml). GitHub only runs
+> workflows that live under `.github/workflows/`, so move that file there — on GitHub, open
+> the file → **Rename** → set the path to `.github/workflows/secret-scan.yml`. It runs three
+> jobs: engine self-test, CLI smoke test, and a self-scan that uploads SARIF to code
+> scanning. Cloning this repo and pushing it also brings the workflow up unchanged.
+
 ### Manage scans
 
 ```bash
