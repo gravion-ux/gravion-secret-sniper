@@ -1,0 +1,29 @@
+)
+        except KeyboardInterrupt:
+            print(f"\n{GR}Interrupted.{X}")
+        return 0
+
+    try:
+        if args.cmd == "scan":
+            cmd_scan(args)
+        elif args.cmd == "export":
+            cmd_export(args)
+        elif args.cmd == "list":
+            cmd_list(args)
+        elif args.cmd == "show":
+            cmd_show(args)
+        elif args.cmd == "clear":
+            cmd_clear(args)
+        elif args.cmd == "ignore":
+            cmd_ignore(args)
+        elif args.cmd == "verify":
+            cmd_verify(args)
+        elif args.cmd == "selftest":
+            return cmd_selftest(args)
+    except KeyboardInterrupt:
+        print(f"\n{GR}Interrupted.{X}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
