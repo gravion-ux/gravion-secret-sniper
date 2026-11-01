@@ -1,0 +1,1078 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+╔═══════════════════════════════════════════════════════════════════╗
+║  GRAVION SECRET SNIPER                                            ║
+║                                                                   ║
+║  Author   : Priyanshu Kumar Thakur (@pkt_143)                     ║
+║  Alias    : Gravion                                               ║
+║  Telegram : @pkt_143                                              ║
+║  GitHub   : https://github.com/gravion-ux                         ║
+║                                                                   ║
+║  Find leaked API keys, tokens, passwords and private keys in any   ║
+║  file, folder, archive, encoded blob or git history.              ║
+║  Detection and verification only · no exploitation.               ║
+║                                                                   ║
+║  Commands:                                                        ║
+║    scan TARGET        →  scan file / folder / archive / repo      ║
+║    scan TARGET --history  →  include full git history             ║
+║    scan -             →  read from stdin                          ║
+║    scan TARGET --verify   →  live-check detected credentials      ║
+║    scan TARGET --baseline B  →  report only NEW secrets vs B      ║
+║    export NAME -f sarif    →  export (sarif / json / csv / html)  ║
+║    list               →  all saved scans                          ║
+║    show NAME          →  display a saved scan                     ║
+║    clear NAME         →  delete a saved scan                      ║
+║    ignore list        →  show allowlist                           ║
+║    ignore add VALUE   →  add hash / pattern / regex to allowlist  ║
+║    ignore remove VALUE→  remove from allowlist                    ║
+║    verify NAME        →  live-check the credentials in a scan     ║
+║    selftest           →  validate the detection engine            ║
+║                                                                   ║
+║  Zero required dependencies.  `requests` is optional and only    ║
+║  needed for live credential verification (--verify).               ║
+╚═══════════════════════════════════════════════════════════════════╝
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import csv
+import hashlib
+import io
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import tarfile
+import time
+import zipfile
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# BRANDING
+# ═══════════════════════════════════════════════════════════════════════
+AUTHOR_NAME = "Priyanshu Kumar Thakur"
+AUTHOR_HANDLE = "@pkt_143"
+AUTHOR_ALIAS = "Gravion"
+TELEGRAM_HANDLE = "@pkt_143"
+TELEGRAM_LINK = "https://t.me/pkt_143"
+GITHUB_LINK = "https://github.com/gravion-ux"
+TOOL_NAME = "Gravion Secret Sniper"
+TOOL_VERSION = "2.0.0"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# COLORS
+# ═══════════════════════════════════════════════════════════════════════
+R  = "\033[91m"
+G  = "\033[92m"
+Y  = "\033[93m"
+W  = "\033[97m"
+GR = "\033[90m"
+B  = "\033[1m"
+C  = "\033[96m"
+M  = "\033[95m"
+X  = "\033[0m"
+
+SEV_COLOR = {
+    "CRITICAL": R + B,
+    "HIGH": R,
+    "MEDIUM": Y,
+    "LOW": C,
+    "INFO": GR,
+}
+SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+SEV_SCORE = {"CRITICAL": 100, "HIGH": 75, "MEDIUM": 50, "LOW": 25, "INFO": 5}
+
+
+def _safe_stdout() -> None:
+    """Force UTF-8 output so the box-drawing/emoji survive a cp1252 console."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════
+APP_DIR_NAME = ".gravion_sniper"
+DATA_DIR = os.path.join(os.path.expanduser("~"), APP_DIR_NAME, "scans")
+ALLOWLIST_FILE = os.path.expanduser(f"~/{APP_DIR_NAME}/allowlist")
+LOCAL_ALLOWLIST = ".gravionignore"
+
+SKIP_DIRS = {
+    ".git", ".hg", ".svn", ".node_modules", "node_modules", "bower_components",
+    "vendor", "__pycache__", ".venv", "venv", "env", ".tox", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache", ".cache", "dist", "build", "target",
+    ".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache", ".gradle",
+    "coverage", "htmlcov", ".idea", ".vscode", ".terraform", "Pods",
+    "DerivedData", "obj", "bin",
+}
+
+SKIP_EXTS = {
+    ".exe", ".dll", ".so", ".dylib", ".bin", ".o", ".a", ".lib", ".obj",
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg", ".tiff",
+    ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".iso", ".dmg",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt",
+    ".mp3", ".mp4", ".avi", ".mov", ".mkv", ".wav", ".flac", ".ogg", ".webm",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf", ".pfb",
+    ".pyc", ".pyo", ".class", ".jar", ".war", ".lock", ".pdb", ".wasm",
+    ".min.js", ".min.css", ".map", ".db", ".sqlite", ".sqlite3", ".mdb",
+}
+
+# Archives are handled specially (they are expanded and scanned internally).
+ARCHIVE_EXTS = {".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".whl", ".jar",
+                ".war", ".ear", ".egg", ".apk", ".aar", ".nupkg", ".vsix"}
+
+# Filenames that are almost always credential material.
+SENSITIVE_FILENAMES = {
+    ".env", ".env.local", ".env.development", ".env.production", ".env.staging",
+    ".env.test", ".env.example", ".envrc", ".netrc", "_netrc", ".npmrc",
+    ".pypirc", ".dockercfg", ".htpasswd", ".pgpass", ".git-credentials",
+    "credentials", "credentials.json", "secrets.json", "secrets.yaml",
+    "secrets.yml", "secrets.toml", "config.json", "service-account.json",
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "identity",
+    ".aws_credentials", ".boto", "kubeconfig", "config.yaml", "config.yml",
+    ".htpasswd", "master.key", "credentials.yml", "applications.yml",
+}
+
+# Files whose mere presence is a signal, even without a regex hit.
+SENSITIVE_FILE_SEVERITY = {
+    ".env": "MEDIUM", ".netrc": "HIGH", "_netrc": "HIGH", ".npmrc": "MEDIUM",
+    ".pypirc": "MEDIUM", ".htpasswd": "HIGH", ".pgpass": "HIGH",
+    ".git-credentials": "CRITICAL", "id_rsa": "HIGH", "id_dsa": "HIGH",
+    "id_ecdsa": "HIGH", "id_ed25519": "HIGH", "credentials": "HIGH",
+    "master.key": "CRITICAL", ".aws_credentials": "HIGH",
+}
+
+MAX_ARCHIVE_ENTRY_BYTES = 8 * 1024 * 1024
+MAX_ARCHIVE_ENTRIES = 2000
+
+# Keywords that make a nearby string far more likely to be a real secret.
+SECRET_KEYWORDS = re.compile(
+    r"(?:pass(?:word|wd)?|pwd|secret|token|api[_\-]?key|apikey|api[_\-]?secret|"
+    r"auth(?:orization)?|credential|private[_\-]?key|access[_\-]?key|"
+    r"client[_\-]?secret|session[_\-]?id|signing[_\-]?key|encryption[_\-]?key|"
+    r"jwt|bearer|refresh[_\-]?token|webhook[_\-]?url)",
+    re.IGNORECASE,
+)
+
+PLACEHOLDER_WORDS = (
+    "password", "example", "changeme", "change_me", "sample", "fake", "dummy",
+    "your_", "your-", "yourkey", "yourpassword", "xxx", "todo", "fixme",
+    "test_", "_test", "placeholder", "default", "replace", "insert",
+    "put_your", "a1b2c3", "abcdef", "123456", "xxxxx", "none", "null", "nil",
+    "true", "false", "localhost", "example.com", "foo", "bar", "baz", "abc123",
+    "<", ">", "redacted", "hidden", "notreal", "dummy_key", "secret_here",
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# PATTERN DATABASE
+#   name      human readable rule name
+#   regex     detection expression
+#   severity  CRITICAL | HIGH | MEDIUM | LOW | INFO
+#   category  grouping used by --only
+#   confidence HIGH | MEDIUM | LOW
+#   context   optional regex; must match within +/-CONTEXT_WINDOW chars
+#   hint      optional literal; fast pre-filter, line must contain it (lower)
+#   entropy   optional minimum Shannon entropy for the captured value
+#   validate  optional callable key -> structural validation
+#   desc      human readable description (used by SARIF / docs)
+# ═══════════════════════════════════════════════════════════════════════
+PATTERNS: List[Dict[str, Any]] = [
+    # ── Cloud providers ───────────────────────────────────────────────
+    dict(name="AWS Access Key ID", category="aws", severity="CRITICAL",
+         confidence="HIGH", entropy=3.0, validator="aws",
+         regex=r"\b((?:AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16})\b",
+         desc="AWS access key identifier (AKIA/ASIA prefix)."),
+    dict(name="AWS Secret Access Key", category="aws", severity="CRITICAL",
+         confidence="HIGH", entropy=3.5,
+         regex=r"(?i:aws_secret_access_key|aws_secret_key|aws_session_token)"
+               r"\s*[:=]\s*[\"']?([A-Za-z0-9/+=]{40})[\"']?",
+         desc="AWS secret access key assignment."),
+    dict(name="AWS MWS Key", category="aws", severity="HIGH", confidence="HIGH",
+         regex=r"\b(amzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+               r"[0-9a-f]{4}-[0-9a-f]{12})\b",
+         desc="Amazon Marketplace Web Service key."),
+    dict(name="AWS Account ID", category="aws", severity="LOW", confidence="MEDIUM",
+         context=r"account|acct|aws",
+         regex=r"(?i:aws_account_id|aws_account)\s*[:=]\s*[\"']?([0-9]{12})[\"']?",
+         desc="AWS account identifier (not a credential by itself)."),
+
+    # ── Google / GCP ───────────────────────────────────────────────────
+    dict(name="Google / Gemini API Key", category="google", severity="CRITICAL",
+         confidence="HIGH", entropy=3.0, validator="google",
+         regex=r"\b(AIza[0-9A-Za-z_\-]{35})\b",
+         desc="Google Cloud / Maps / Firebase / Gemini API key."),
+    dict(name="Google OAuth Client Secret", category="google", severity="CRITICAL",
+         confidence="HIGH", entropy=3.0,
+         regex=r"\b(GOCSPX-[A-Za-z0-9_\-]{28})\b",
+         desc="Google OAuth 2.0 client secret."),
+    dict(name="Google OAuth Client ID", category="google", severity="LOW",
+         confidence="HIGH",
+         regex=r"\b([0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com)\b",
+         desc="Google OAuth 2.0 client identifier (public half)."),
+    dict(name="GCP Service Account", category="gcp", severity="CRITICAL",
+         confidence="HIGH",
+         regex=r"[\"']type[\"']\s*:\s*[\"']service_account[\"']",
+         desc="GCP service-account JSON key material."),
+    dict(name="GCP Service Account Private Key", category="gcp",
+         severity="CRITICAL", confidence="HIGH",
+         regex=r"[\"']private_key[\"']\s*:\s*[\"'](-----BEGIN[A-Z ]*PRIVATE KEY-----)",
+         desc="Embedded service-account private key."),
+    dict(name="Firebase Cloud Messaging Key", category="firebase", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(AAAA[A-Za-z0-9_\-]{7}:APA91b[A-Za-z0-9_\-]{130,})\b",
+         desc="Firebase Cloud Messaging server key."),
+    dict(name="Firebase URL", category="firebase", severity="LOW", confidence="HIGH",
+         regex=r"\b(https://[a-z0-9\-]+\.firebaseio\.com)\b",
+         desc="Firebase realtime-database endpoint."),
+
+    # ── Azure ──────────────────────────────────────────────────────────
+    dict(name="Azure Storage Account Key", category="azure", severity="CRITICAL",
+         confidence="HIGH", entropy=3.5,
+         regex=r"(?i:AccountKey|account_key)\s*=\s*([A-Za-z0-9+/=]{86,92})",
+         desc="Azure storage account access key."),
+    dict(name="Azure SAS Token", category="azure", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(sv=\d{4}-\d{2}-\d{2}&(?:sr|sp|sig|se)=[^\s&\"']{8,})",
+         desc="Azure shared access signature query string."),
+    dict(name="Azure AD Client Secret", category="azure", severity="CRITICAL",
+         confidence="HIGH", entropy=3.0,
+         regex=r"(?i:azure_ad_client_secret|azure_client_secret|client_secret)"
+               r"\s*[:=]\s*[\"']([A-Za-z0-9~._\-]{34,})[\"']",
+         desc="Azure AD / Entra client secret."),
+
+    # ── GitHub ─────────────────────────────────────────────────────────
+    dict(name="GitHub PAT (classic)", category="github", severity="CRITICAL",
+         confidence="HIGH", entropy=3.0, validator="github",
+         regex=r"\b(ghp_[A-Za-z0-9]{36})\b",
+         desc="Classic GitHub personal access token."),
+    dict(name="GitHub Fine-Grained PAT", category="github", severity="CRITICAL",
+         confidence="HIGH", entropy=3.0, validator="github",
+         regex=r"\b(github_pat_[A-Za-z0-9_]{82})\b",
+         desc="Fine-grained GitHub personal access token."),
+    dict(name="GitHub OAuth Token", category="github", severity="HIGH",
+         confidence="HIGH", validator="github",
+         regex=r"\b(gho_[A-Za-z0-9]{36})\b",
+         desc="GitHub OAuth access token."),
+    dict(name="GitHub App Token", category="github", severity="HIGH",
+         confidence="HIGH", validator="github",
+         regex=r"\b(ghs_[A-Za-z0-9]{36})\b",
+         desc="GitHub App installation token."),
+    dict(name="GitHub User Token", category="github", severity="HIGH",
+         confidence="HIGH", validator="github",
+         regex=r"\b(ghu_[A-Za-z0-9]{36})\b",
+         desc="GitHub user-to-server token."),
+    dict(name="GitHub Refresh Token", category="github", severity="HIGH",
+         confidence="HIGH", validator="github",
+         regex=r"\b(ghr_[A-Za-z0-9]{36})\b",
+         desc="GitHub refresh token."),
+
+    # ── GitLab / Bitbucket ─────────────────────────────────────────────
+    dict(name="GitLab PAT", category="gitlab", severity="CRITICAL",
+         confidence="HIGH", entropy=3.0,
+         regex=r"\b(glpat-[A-Za-z0-9_\-]{20})\b",
+         desc="GitLab personal access token."),
+    dict(name="GitLab Runner Token", category="gitlab", severity="CRITICAL",
+         confidence="HIGH",
+         regex=r"\b(GR1348941[0-9A-Za-z_\-]{20,})\b",
+         desc="GitLab CI runner registration token."),
+    dict(name="Bitbucket App Password", category="bitbucket", severity="HIGH",
+         confidence="MEDIUM",
+         context=r"bitbucket|bb_",
+         regex=r"\b(bb_[0-9A-Za-z_\-]{20,})\b",
+         desc="Bitbucket app password."),
+
+    # ── Chat / messaging ───────────────────────────────────────────────
+    dict(name="Slack Webhook", category="slack", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(https://hooks\.slack\.com/services/T[A-Z0-9]{6,}/"
+               r"B[A-Z0-9]{6,}/[A-Za-z0-9]{20,})",
+         desc="Slack incoming-webhook URL."),
+    dict(name="Slack Bot Token", category="slack", severity="CRITICAL",
+         confidence="HIGH", entropy=3.0, validator="slack",
+         regex=r"\b(xoxb-[A-Za-z0-9\-]{10,72})\b",
+         desc="Slack bot OAuth token."),
+    dict(name="Slack User Token", category="slack", severity="CRITICAL",
+         confidence="HIGH", entropy=3.0, validator="slack",
+         regex=r"\b(xox[aprs]-[A-Za-z0-9\-]{10,72})\b",
+         desc="Slack user/admin OAuth token."),
+    dict(name="Slack App Token", category="slack", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(xapp-[A-Za-z0-9\-]{10,72})\b",
+         desc="Slack app-level token."),
+    dict(name="Discord Bot Token", category="discord", severity="CRITICAL",
+         confidence="HIGH", entropy=3.0,
+         regex=r"\b([MN][A-Za-z\d]{23}\.[\w\-]{6}\.[\w\-]{27})\b",
+         desc="Discord bot token."),
+    dict(name="Discord Webhook", category="discord", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/"
+               r"\d+/[\w\-]{20,})",
+         desc="Discord webhook URL."),
+    dict(name="Telegram Bot Token", category="telegram", severity="HIGH",
+         confidence="HIGH", validator="telegram",
+         regex=r"\b([0-9]{8,10}:[A-Za-z0-9_\-]{35})\b",
+         desc="Telegram bot API token."),
+    dict(name="Telegram Webhook Secret", category="telegram", severity="MEDIUM",
+         confidence="MEDIUM",
+         context=r"telegram|webhook",
+         regex=r"(?i:telegram[_\-]?(?:webhook[_\-]?)?secret[_\-]?token)\s*[:=]\s*"
+               r"[\"']?([A-Za-z0-9_\-]{16,64})[\"']?",
+         desc="Telegram webhook secret token."),
+
+    # ── Payments ───────────────────────────────────────────────────────
+    dict(name="Stripe Live Secret Key", category="stripe", severity="CRITICAL",
+         confidence="HIGH", entropy=3.0, validator="stripe",
+         regex=r"\b(sk_live_[0-9a-zA-Z]{16,})\b",
+         desc="Stripe live secret key."),
+    dict(name="Stripe Restricted Key", category="stripe", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(rk_live_[0-9a-zA-Z]{16,})\b",
+         desc="Stripe restricted live key."),
+    dict(name="Stripe Test Secret Key", category="stripe", severity="MEDIUM",
+         confidence="HIGH", validator="stripe",
+         regex=r"\b(sk_test_[0-9a-zA-Z]{16,})\b",
+         desc="Stripe test secret key (non-production)."),
+    dict(name="Stripe Webhook Secret", category="stripe", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(whsec_[0-9a-zA-Z]{24,})\b",
+         desc="Stripe webhook signing secret."),
+    dict(name="PayPal Braintree Access Token", category="braintree",
+         severity="CRITICAL", confidence="HIGH",
+         regex=r"\b(access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32})\b",
+         desc="Braintree production access token."),
+    dict(name="Square Access Token", category="square", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(sq0atp-[0-9A-Za-z_\-]{22})\b",
+         desc="Square access token."),
+    dict(name="Square OAuth Secret", category="square", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(sq0csp-[0-9A-Za-z_\-]{43})\b",
+         desc="Square OAuth client secret."),
+    dict(name="PayPal Client Secret", category="paypal", severity="CRITICAL",
+         confidence="HIGH", entropy=3.0,
+         context=r"paypal|paypal_secret",
+         regex=r"(?i:paypal[_\-]?secret|paypal[_\-]?client[_\-]?secret)\s*[:=]\s*"
+               r"[\"']([A-Za-z0-9_\-]{24,})[\"']",
+         desc="PayPal API client secret."),
+    dict(name="Razorpay Key ID", category="razorpay", severity="MEDIUM",
+         confidence="MEDIUM", context=r"razorpay",
+         regex=r"\b(rzp_(?:live|test)_[A-Za-z0-9]{10,})\b",
+         desc="Razorpay key identifier."),
+    dict(name="Razorpay Key Secret", category="razorpay", severity="CRITICAL",
+         confidence="HIGH", entropy=3.0, context=r"razorpay",
+         regex=r"(?i:razorpay[_\-]?secret[_\-]?key)\s*[:=]\s*[\"']([A-Za-z0-9]{20,})[\"']",
+         desc="Razorpay key secret."),
+
+    # ── AI / LLM providers ─────────────────────────────────────────────
+    dict(name="OpenAI API Key", category="openai", severity="CRITICAL",
+         confidence="HIGH", entropy=3.0, validator="openai",
+         regex=r"\b(sk-(?:proj-)?(?!ant-)[A-Za-z0-9_\-]{32,})\b",
+         desc="OpenAI API key (legacy or project-scoped)."),
+    dict(name="Anthropic API Key", category="anthropic", severity="CRITICAL",
+         confidence="HIGH", entropy=3.0, validator="anthropic",
+         regex=r"\b(sk-ant-[A-Za-z0-9_\-]{32,})\b",
+         desc="Anthropic Claude API key."),
+    dict(name="Hugging Face Token", category="huggingface", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(hf_[A-Za-z0-9]{34,40})\b",
+         desc="Hugging Face access token."),
+    dict(name="Cohere API Key", category="cohere", severity="HIGH",
+         confidence="HIGH",
+         regex=r"(?i:cohere[_\-]?(?:api[_\-]?)?key)\s*[:=]\s*[\"']([A-Za-z0-9]{40})[\"']",
+         desc="Cohere API key."),
+    dict(name="Replicate API Token", category="replicate", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(r8_[A-Za-z0-9]{37})\b",
+         desc="Replicate API token."),
+    dict(name="Groq API Key", category="groq", severity="HIGH", confidence="HIGH",
+         regex=r"\b(gsk_[A-Za-z0-9]{48,})\b",
+         desc="Groq API key."),
+    dict(name="Mistral API Key", category="mistral", severity="HIGH",
+         confidence="HIGH",
+         regex=r"(?i:mistral[_\-]?api[_\-]?key)\s*[:=]\s*[\"']([A-Za-z0-9]{32})[\"']",
+         desc="Mistral API key."),
+    dict(name="OpenRouter API Key", category="openrouter", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(sk-or-v1-[A-Za-z0-9]{64})\b",
+         desc="OpenRouter API key."),
+
+    # ── Private keys / certificates ────────────────────────────────────
+    dict(name="Private Key Header", category="private-key", severity="CRITICAL",
+         confidence="HIGH",
+         regex=r"(-----BEGIN [A-Z0-9 ]{0,48}PRIVATE KEY(?: BLOCK)?-----)",
+         desc="PEM private-key header (complete block detected separately)."),
+    dict(name="PuTTY Private Key", category="private-key", severity="CRITICAL",
+         confidence="HIGH",
+         regex=r"(-----BEGIN SSH2 ENCRYPTED PRIVATE KEY-----)",
+         desc="PuTTY / SSH2 encrypted private key header."),
+    dict(name="PKCS12 Keystore", category="private-key", severity="HIGH",
+         confidence="MEDIUM",
+         regex=r"(?i:keystore[_\-]?password|keystore[_\-]?pass)\s*[:=]\s*[\"']([^\"']{4,64})[\"']",
+         desc="Keystore password (often protects a PKCS12 bundle)."),
+    dict(name="Certificates (PEM)", category="certificate", severity="INFO",
+         confidence="HIGH",
+         regex=r"(-----BEGIN CERTIFICATE-----)",
+         desc="X.509 certificate (public material, informational)."),
+
+    # ── Tokens / sessions ──────────────────────────────────────────────
+    dict(name="JSON Web Token", category="jwt", severity="HIGH", confidence="HIGH",
+         regex=r"\b(eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\."
+               r"[A-Za-z0-9_\-]{10,})\b",
+         desc="JSON Web Token."),
+    dict(name="Bearer Token", category="generic", severity="MEDIUM",
+         confidence="MEDIUM", entropy=3.5,
+         regex=r"(?i:bearer)\s+([A-Za-z0-9\-._~+/]{20,})",
+         desc="HTTP Authorization bearer token."),
+    dict(name="Basic Auth Credentials", category="generic", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(https?://[^\s:/@]{1,64}:[^\s:/@]{1,64}@[^\s/]{2,})",
+         desc="URL containing inline basic-auth credentials."),
+    dict(name="Generic API Key", category="generic", severity="MEDIUM",
+         confidence="LOW", entropy=3.5,
+         context=r"api[_\-]?key|apikey|api[_\-]?secret|api[_\-]?token|"
+                 r"access[_\-]?key",
+         regex=r"[\"']([A-Za-z0-9_\-]{20,64})[\"']",
+         desc="Quoted value assigned near an api-key keyword."),
+    dict(name="Generic Secret", category="generic", severity="MEDIUM",
+         confidence="LOW", entropy=3.5,
+         context=r"(?:secret|private)[_\-]?(?:key|token|value)|client[_\-]?secret|"
+                 r"signing[_\-]?key",
+         regex=r"[\"']([A-Za-z0-9_\-./+=]{16,80})[\"']",
+         desc="Quoted value assigned near a secret keyword."),
+    dict(name="Generic Password", category="generic", severity="LOW",
+         confidence="LOW",
+         context=r"(?:password|passwd|pwd|passphrase)\s*[:=]",
+         regex=r"[\"']([^\"'\s]{6,80})[\"']",
+         desc="Quoted value assigned to a password keyword."),
+    dict(name="Private Key Assignment", category="private-key", severity="CRITICAL",
+         confidence="HIGH",
+         context=r"private[_\-]?key",
+         regex=r"(?i:private[_\-]?key)\s*[:=]\s*[\"']([A-Za-z0-9/+=]{32,})[\"']",
+         desc="PEM body stored inline without the header."),
+
+    # ── Package registries ─────────────────────────────────────────────
+    dict(name="NPM Token", category="npm", severity="HIGH", confidence="HIGH",
+         validator="npm",
+         regex=r"\b(npm_[A-Za-z0-9]{36})\b",
+         desc="npm access token."),
+    dict(name="npm _authToken", category="npm", severity="HIGH", confidence="HIGH",
+         regex=r"(?i:_authToken)\s*=\s*([A-Za-z0-9_\-]{20,})",
+         desc="npm .npmrc _authToken entry."),
+    dict(name="PyPI Token", category="pypi", severity="HIGH", confidence="HIGH",
+         regex=r"\b(pypi-AgEIcHlwaS5vcmc[A-Za-z0-9_\-]{50,})\b",
+         desc="PyPI upload token."),
+    dict(name="PyPI Password", category="pypi", severity="HIGH", confidence="HIGH",
+         context=r"pypi|password",
+         regex=r"(?i:pypi[_\-]?password)\s*[:=]\s*[\"']([^\"']{8,64})[\"']",
+         desc="PyPI account password."),
+    dict(name="Docker Hub PAT", category="docker", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(dckr_pat_[A-Za-z0-9_\-]{22,})\b",
+         desc="Docker Hub personal access token."),
+    dict(name="Docker Registry Auth", category="docker", severity="HIGH",
+         confidence="HIGH",
+         regex=r"(?i:docker[_\-]?(?:password|hub[_\-]?password))\s*[:=]\s*[\"']([^\"']{8,64})[\"']",
+         desc="Docker registry password."),
+
+    # ── Databases / infrastructure ─────────────────────────────────────
+    dict(name="PostgreSQL Connection String", category="database",
+         severity="CRITICAL", confidence="HIGH",
+         regex=r"\b(postgres(?:ql)?://[^\s:/@]{1,64}:[^\s:/@]{1,64}@[^\s/?]{2,})",
+         desc="PostgreSQL URI with inline credentials."),
+    dict(name="MySQL/MariaDB Connection String", category="database",
+         severity="CRITICAL", confidence="HIGH",
+         regex=r"\b(mysql://[^\s:/@]{1,64}:[^\s:/@]{1,64}@[^\s/?]{2,})",
+         desc="MySQL / MariaDB URI with inline credentials."),
+    dict(name="MongoDB Connection String", category="database",
+         severity="CRITICAL", confidence="HIGH",
+         regex=r"\b(mongodb(?:\+srv)?://[^\s:/@]{1,64}:[^\s:/@]{1,64}@[^\s/?]{2,})",
+         desc="MongoDB URI with inline credentials."),
+    dict(name="Redis Connection String", category="database", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(redis(?:s)?://[^\s:/@]{0,64}:[^\s:/@]{1,64}@[^\s/?]{2,})",
+         desc="Redis URI with inline credentials."),
+    dict(name="AMQP Connection String", category="database", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(amqps?://[^\s:/@]{1,64}:[^\s:/@]{1,64}@[^\s/?]{2,})",
+         desc="AMQP (RabbitMQ) URI with inline credentials."),
+    dict(name="Elasticsearch Credentials", category="database", severity="HIGH",
+         confidence="MEDIUM",
+         regex=r"(?i:elastic[_\-]?(?:search)?[_\-]?password)\s*[:=]\s*[\"']([^\"']{6,64})[\"']",
+         desc="Elasticsearch password."),
+    dict(name="Supabase Service Key", category="supabase",
+         severity="CRITICAL", confidence="HIGH", validator="supabase",
+         regex=r"\b(sbp_[a-f0-9]{40})\b",
+         desc="Supabase service-role / project key."),
+    dict(name="PlanetScale Password", category="database", severity="HIGH",
+         confidence="MEDIUM",
+         regex=r"(?i:planetscale[_\-]?password)\s*[:=]\s*[\"']([^\"']{8,64})[\"']",
+         desc="PlanetScale database password."),
+    dict(name="Snowflake Credentials", category="database", severity="HIGH",
+         confidence="HIGH",
+         context=r"snowflake",
+         regex=r"(?i:snowflake[_\-]?(?:password|secret))\s*[:=]\s*[\"']([^\"']{8,64})[\"']",
+         desc="Snowflake account password / secret."),
+    dict(name="BigQuery Service Account", category="database", severity="HIGH",
+         confidence="MEDIUM",
+         regex=r"(?i:bigquery[_\-]?(?:key|json))\s*[:=]\s*[\"']?([^\"'\s]{20,})",
+         desc="BigQuery service-account key reference."),
+
+    # ── Infrastructure as code ─────────────────────────────────────────
+    dict(name="Terraform State Password", category="iac", severity="HIGH",
+         confidence="MEDIUM",
+         regex=r"(?i:\"?password\"?\s*:\s*\"([^\"]{6,64})\")",
+         desc="Password recorded inside Terraform state."),
+
+    # ── Cloud / hosting ────────────────────────────────────────────────
+    dict(name="Cloudflare API Token", category="cloudflare", severity="CRITICAL",
+         confidence="HIGH",
+         regex=r"\b(v1\.0-[a-f0-9]{24}-[a-f0-9]{146})\b",
+         desc="Cloudflare API token."),
+    dict(name="Cloudflare Global API Key", category="cloudflare", severity="CRITICAL",
+         confidence="HIGH",
+         context=r"cloudflare",
+         regex=r"(?i:cloudflare[_\-]?global[_\-]?api[_\-]?key)\s*[:=]\s*[\"']([a-f0-9]{37})[\"']",
+         desc="Cloudflare global API key."),
+    dict(name="DigitalOcean PAT", category="digitalocean", severity="CRITICAL",
+         confidence="HIGH",
+         regex=r"\b(dop_v1_[a-f0-9]{64})\b",
+         desc="DigitalOcean personal access token."),
+    dict(name="DigitalOcean OAuth", category="digitalocean", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(doo_v1_[a-f0-9]{64})\b",
+         desc="DigitalOcean OAuth token."),
+    dict(name="Linode API Token", category="linode", severity="HIGH",
+         confidence="HIGH",
+         regex=r"(?i:linode[_\-]?api[_\-]?key)\s*[:=]\s*[\"']([A-Za-z0-9]{64})[\"']",
+         desc="Linode API key."),
+    dict(name="Vultr API Key", category="vultr", severity="HIGH",
+         confidence="MEDIUM",
+         regex=r"(?i:vultr[_\-]?api[_\-]?key)\s*[:=]\s*[\"']([A-Za-z0-9]{36,})[\"']",
+         desc="Vultr API key."),
+    dict(name="Heroku API Key", category="heroku", severity="HIGH",
+         confidence="MEDIUM", entropy=3.5,
+         regex=r"(?i:heroku[_\-]?api[_\-]?key)\s*[:=]\s*[\"']([A-Za-z0-9]{36,48})[\"']",
+         desc="Heroku platform API key."),
+
+    # ── SaaS / integrations ────────────────────────────────────────────
+    dict(name="SendGrid API Key", category="sendgrid", severity="CRITICAL",
+         confidence="HIGH", validator="sendgrid",
+         regex=r"\b(SG\.[A-Za-z0-9_\-]{16,32}\.[A-Za-z0-9_\-]{16,64})\b",
+         desc="SendGrid API key."),
+    dict(name="Mailgun API Key", category="mailgun", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(key-[a-f0-9]{32})\b",
+         desc="Mailgun API key."),
+    dict(name="Mailgun Signing Key", category="mailgun", severity="HIGH",
+         confidence="HIGH",
+         regex=r"(?i:mailgun[_\-]?(?:webhook[_\-]?)?signing[_\-]?key)\s*[:=]\s*"
+               r"[\"']([a-f0-9]{32,64})[\"']",
+         desc="Mailgun webhook signing key."),
+    dict(name="Mailchimp API Key", category="mailchimp", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b([0-9a-f]{32}-us\d{1,2})\b",
+         desc="Mailchimp API key (datacenter suffix)."),
+    dict(name="Postmark Server Token", category="postmark", severity="HIGH",
+         confidence="HIGH",
+         regex=r"(?i:postmark[_\-]?(?:server[_\-]?)?token)\s*[:=]\s*"
+               r"[\"']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[\"']",
+         desc="Postmark server API token."),
+    dict(name="Twilio Account SID", category="twilio", severity="MEDIUM",
+         confidence="MEDIUM", context=r"twilio|account.?sid",
+         regex=r"\b(AC[a-f0-9]{32})\b",
+         desc="Twilio account identifier (not a secret by itself)."),
+    dict(name="Twilio API Key", category="twilio", severity="HIGH",
+         confidence="MEDIUM", context=r"twilio",
+         regex=r"\b(SK[a-f0-9]{32})\b",
+         desc="Twilio API key secret."),
+    dict(name="Twilio Auth Token", category="twilio", severity="CRITICAL",
+         confidence="HIGH",
+         regex=r"(?i:twilio[_\-]?auth[_\-]?token)\s*[:=]\s*[\"']([a-f0-9]{32})[\"']",
+         desc="Twilio account auth token."),
+    dict(name="Segment Public Write Key", category="segment", severity="MEDIUM",
+         confidence="MEDIUM",
+         regex=r"\b([0-9a-z]{24})\b",
+         context=r"segment", entropy=3.5,
+         desc="Segment source write key."),
+    dict(name="Sentry Auth Token", category="sentry", severity="HIGH",
+         confidence="HIGH",
+         regex=r"(?i:sentry[_\-]?(?:auth[_\-]?token|dsn))\s*[:=]\s*"
+               r"[\"']?(https://[0-9a-f]{32}@[A-Za-z0-9.\-]+/[0-9]+)",
+         desc="Sentry DSN / auth token."),
+    dict(name="Algolia Admin Key", category="algolia", severity="HIGH",
+         confidence="HIGH",
+         regex=r"(?i:algolia[_\-]?(?:admin[_\-]?key|api[_\-]?key))\s*[:=]\s*"
+               r"[\"']([a-f0-9]{32})[\"']",
+         desc="Algolia admin API key."),
+    dict(name="Linear API Key", category="linear", severity="HIGH", confidence="HIGH",
+         regex=r"\b(lin_api_[A-Za-z0-9]{40})\b",
+         desc="Linear API key."),
+    dict(name="Notion Integration Token", category="notion", severity="HIGH",
+         confidence="HIGH", context=r"notion",
+         regex=r"\b(secret_[A-Za-z0-9]{43})\b",
+         desc="Notion internal integration token."),
+    dict(name="Notion API Token", category="notion", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(ntn_[A-Za-z0-9]{40})\b",
+         desc="Notion API token."),
+    dict(name="Airtable PAT", category="airtable", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(pat[A-Za-z0-9]{14}\.[A-Za-z0-9]{64})\b",
+         desc="Airtable personal access token."),
+    dict(name="Airtable API Key", category="airtable", severity="MEDIUM",
+         confidence="MEDIUM", context=r"airtable", entropy=3.0,
+         regex=r"\b(key[A-Za-z0-9]{14})\b",
+         desc="Airtable legacy API key."),
+    dict(name="Datadog API Key", category="datadog", severity="MEDIUM",
+         confidence="MEDIUM", context=r"datadog", entropy=3.5,
+         regex=r"\b(dd[a-z0-9]{32,36})\b",
+         desc="Datadog API key."),
+    dict(name="Postman API Key", category="postman", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(PMAK-[a-f0-9]{24}-[a-f0-9]{34})\b",
+         desc="Postman API key."),
+    dict(name="Vercel Token", category="vercel", severity="HIGH", confidence="MEDIUM",
+         regex=r"(?i:vercel[_\-]?token)\s*[:=]\s*[\"']([A-Za-z0-9]{24})[\"']",
+         desc="Vercel access token."),
+    dict(name="Netlify Auth Token", category="netlify", severity="HIGH",
+         confidence="HIGH",
+         regex=r"(?i:netlify[_\-]?auth[_\-]?token)\s*[:=]\s*[\"']([A-Za-z0-9_\-]{20,})[\"']",
+         desc="Netlify personal access token."),
+    dict(name="Railway Token", category="railway", severity="HIGH",
+         confidence="MEDIUM",
+         regex=r"(?i:railway[_\-]?(?:token|api[_\-]?key))\s*[:=]\s*[\"']([A-Za-z0-9_\-]{20,})[\"']",
+         desc="Railway deployment token."),
+    dict(name="CircleCI Token", category="circleci", severity="HIGH",
+         confidence="HIGH",
+         regex=r"(?i:circle[_\-]?ci[_\-]?token)\s*[:=]\s*[\"']([a-f0-9]{40})[\"']",
+         desc="CircleCI API token."),
+    dict(name="Codecov Token", category="codecov", severity="MEDIUM",
+         confidence="MEDIUM",
+         regex=r"(?i:codecov[_\-]?token)\s*[:=]\s*[\"']([A-Za-z0-9]{32,})[\"']",
+         desc="Codecov upload token."),
+    dict(name="Shopify Access Token", category="shopify", severity="CRITICAL",
+         confidence="HIGH",
+         regex=r"\b(shpat_[a-fA-F0-9]{32})\b",
+         desc="Shopify custom-app access token."),
+    dict(name="Shopify Custom App Token", category="shopify", severity="CRITICAL",
+         confidence="HIGH",
+         regex=r"\b(shpca_[a-fA-F0-9]{32})\b",
+         desc="Shopify custom-app token."),
+    dict(name="Shopify Private App Token", category="shopify", severity="CRITICAL",
+         confidence="HIGH",
+         regex=r"\b(shppa_[a-fA-F0-9]{32})\b",
+         desc="Shopify private-app token."),
+    dict(name="Shopify Shared Secret", category="shopify", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(shpss_[a-fA-F0-9]{32})\b",
+         desc="Shopify shared secret."),
+    dict(name="Square OAuth Client ID", category="square", severity="LOW",
+         confidence="HIGH",
+         regex=r"\b(sq0idp-[0-9A-Za-z_\-]{22})\b",
+         desc="Square OAuth client identifier (public half)."),
+
+    # ── Auth providers / identity ──────────────────────────────────────
+    dict(name="Okta Token", category="okta", severity="CRITICAL", confidence="HIGH",
+         regex=r"(?i:okta[_\-]?(?:api[_\-]?token|api[_\-]?key))\s*[:=]\s*"
+               r"[\"']([A-Za-z0-9_\-]{40,})[\"']",
+         desc="Okta API token."),
+    dict(name="Auth0 Client Secret", category="auth0", severity="CRITICAL",
+         confidence="HIGH", entropy=3.0,
+         regex=r"(?i:auth0[_\-]?(?:client[_\-]?secret|secret))\s*[:=]\s*"
+               r"[\"']([A-Za-z0-9_\-]{32,})[\"']",
+         desc="Auth0 client secret."),
+    dict(name="Clerk Secret Key", category="clerk", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(sk_(?:test|live)_[A-Za-z0-9]{20,})\b",
+         desc="Clerk secret key."),
+    dict(name="Doppler API Token", category="doppler", severity="HIGH",
+         confidence="HIGH",
+         regex=r"(?i:doppler[_\-]?token)\s*[:=]\s*[\"'](dp\.[A-Za-z0-9_\-]{20,})[\"']",
+         desc="Doppler service token."),
+    dict(name="1Password Service Account Token", category="onepassword",
+         severity="CRITICAL", confidence="HIGH",
+         regex=r"\b(ops_eyJ[A-Za-z0-9_\-]{40,})\b",
+         desc="1Password service-account token."),
+
+    # ── Observability / analytics ──────────────────────────────────────
+    dict(name="New Relic License Key", category="newrelic", severity="HIGH",
+         confidence="HIGH",
+         regex=r"(?i:newrelic[_\-]?(?:license[_\-]?key|key))\s*[:=]\s*"
+               r"[\"']([a-f0-9]{40})[\"']",
+         desc="New Relic license key."),
+    dict(name="Mixpanel Token", category="mixpanel", severity="MEDIUM",
+         confidence="MEDIUM", context=r"mixpanel", entropy=3.5,
+         regex=r"\b([a-f0-9]{32})\b",
+         desc="Mixpanel project token."),
+    dict(name="Amplitude API Key", category="amplitude", severity="MEDIUM",
+         confidence="MEDIUM", context=r"amplitude", entropy=3.5,
+         regex=r"\b([a-f0-9]{32})\b",
+         desc="Amplitude project API key."),
+
+    # ── Social ─────────────────────────────────────────────────────────
+    dict(name="Twitter/X Bearer Token", category="twitter", severity="HIGH",
+         confidence="MEDIUM", context=r"twitter|bearer", entropy=4.0,
+         regex=r"\b(A{22}[A-Za-z0-9%]{80,120})\b",
+         desc="Twitter/X API bearer token."),
+    dict(name="Facebook Access Token", category="facebook", severity="HIGH",
+         confidence="HIGH",
+         regex=r"\b(EAACEdEose0cBA[0-9A-Za-z]+)\b",
+         desc="Facebook graph API access token."),
+
+    # ── Build / CI ─────────────────────────────────────────────────────
+    dict(name="Bazel Remote Cache Token", category="ci", severity="MEDIUM",
+         confidence="MEDIUM",
+         regex=r"(?i:bazel[_\-]?rc[_\-]?token)\s*[:=]\s*[\"']([A-Za-z0-9_\-]{16,})[\"']",
+         desc="Bazel remote-cache auth token."),
+    dict(name="Artifactory Token", category="ci", severity="HIGH",
+         confidence="MEDIUM",
+         regex=r"(?i:artifactory[_\-]?(?:api[_\-]?key|token))\s*[:=]\s*"
+               r"[\"']([A-Za-z0-9_\-]{16,})[\"']",
+         desc="Artifactory API key / token."),
+    dict(name="Azure DevOps PAT", category="azure", severity="CRITICAL",
+         confidence="HIGH",
+         regex=r"\b([a-z0-9]{52})\b",
+         context=r"azure[_\-]?devops|vsts|pat", entropy=3.0,
+         desc="Azure DevOps personal access token."),
+]
+
+CONTEXT_WINDOW = 60
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# STRUCTURAL VALIDATORS
+#   A validator inspects the captured value and returns (ok, reason).
+#   It never performs network I/O - live checks live in the verifier.
+# ═══════════════════════════════════════════════════════════════════════
+def _validate_aws_key(value: str) -> Tuple[bool, str]:
+    """AWS key IDs are base32-ish uppercase; reject impossible shapes."""
+    if not re.fullmatch(r"[A-Z0-9]{20}", value):
+        return False, "not 20 uppercase alphanumerics"
+    if not value.startswith(("AKIA", "ASIA", "AROA", "AIDA", "AGPA", "ANPA",
+                             "ANVA", "AIPA")):
+        return False, "unknown AWS key prefix"
+    if len(set(value)) < 6:
+        return False, "insufficient character variety"
+    return True, "valid AWS key-id shape"
+
+
+PEM_BLOCK_RE = re.compile(
+    r"-----BEGIN (?P<label>[A-Z0-9 ]{0,48}PRIVATE KEY(?: BLOCK)?)-----"
+    r"[\s\S]{0,16384}?"
+    r"-----END (?P<endlabel>[A-Z0-9 ]{0,48}PRIVATE KEY(?: BLOCK)?)-----"
+)
+
+
+def _validate_jwt(value: str) -> Tuple[bool, str]:
+    """Decode the JOSE header and payload; reject malformed tokens."""
+    parts = value.split(".")
+    if len(parts) != 3:
+        return False, "not three JWT segments"
+    try:
+        header = json.loads(base64.urlsafe_b64decode(parts[0] + "=" * (-len(parts[0]) % 4)))
+    except Exception:
+        return False, "header is not valid base64url JSON"
+    if not isinstance(header, dict) or "alg" not in header:
+        return False, "header missing alg"
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+    except Exception:
+        return False, "payload is not valid base64url JSON"
+    if not isinstance(payload, dict):
+        return False, "payload is not a JSON object"
+    return True, f"valid JWT (alg={header.get('alg')})"
+
+
+def _validate_github_pat(value: str) -> Tuple[bool, str]:
+    if re.fullmatch(r"gh[pousr]_[A-Za-z0-9]{36}", value):
+        return True, "valid GitHub token shape"
+    if re.fullmatch(r"github_pat_[A-Za-z0-9_]{82}", value):
+        return True, "valid fine-grained GitHub token shape"
+    return False, "wrong token length or alphabet"
+
+
+def _validate_stripe(value: str) -> Tuple[bool, str]:
+    m = re.fullmatch(r"sk_(live|test)_([0-9a-zA-Z]{16,})", value)
+    if not m:
+        return False, "wrong Stripe key shape"
+    return True, f"Stripe {m.group(1)} key"
+
+
+def _validate_slack(value: str) -> Tuple[bool, str]:
+    if not re.fullmatch(r"xox[abprs]-[A-Za-z0-9\-]{10,72}", value):
+        return False, "wrong Slack token shape"
+    return True, "valid Slack token shape"
+
+
+def _validate_anthropic(value: str) -> Tuple[bool, str]:
+    if not value.startswith("sk-ant-"):
+        return False, "missing sk-ant- prefix"
+    return True, "valid Anthropic key shape"
+
+
+def _validate_openai(value: str) -> Tuple[bool, str]:
+    if value.startswith("sk-proj-"):
+        return True, "project-scoped OpenAI key"
+    if re.fullmatch(r"sk-[A-Za-z0-9]{48}", value):
+        return True, "legacy OpenAI key"
+    return False, "wrong OpenAI key shape"
+
+
+def _validate_google(value: str) -> Tuple[bool, str]:
+    if not re.fullmatch(r"AIza[0-9A-Za-z_\-]{35}", value):
+        return False, "wrong Google API key shape"
+    return True, "valid Google API key shape"
+
+
+def _validate_private_key(value: str) -> Tuple[bool, str]:
+    if not value.startswith("-----BEGIN"):
+        return False, "missing PEM header"
+    if "PRIVATE KEY" not in value:
+        return False, "not a private-key block"
+    return True, "PEM private key block"
+
+
+def _validate_sendgrid(value: str) -> Tuple[bool, str]:
+    if not re.fullmatch(r"SG\.[A-Za-z0-9_\-]{16,32}\.[A-Za-z0-9_\-]{16,64}", value):
+        return False, "wrong SendGrid key shape"
+    return True, "valid SendGrid key shape"
+
+
+def _validate_npm(value: str) -> Tuple[bool, str]:
+    if not re.fullmatch(r"npm_[A-Za-z0-9]{36}", value):
+        return False, "wrong npm token shape"
+    return True, "valid npm token shape"
+
+
+def _validate_telegram(value: str) -> Tuple[bool, str]:
+    if not re.fullmatch(r"[0-9]{8,10}:[A-Za-z0-9_\-]{35}", value):
+        return False, "wrong Telegram token shape"
+    return True, "valid Telegram token shape"
+
+
+def _validate_supabase(value: str) -> Tuple[bool, str]:
+    if not re.fullmatch(r"sbp_[a-f0-9]{40}", value):
+        return False, "wrong Supabase key shape"
+    return True, "valid Supabase key shape"
+
+
+VALIDATORS: Dict[str, Callable[[str], Tuple[bool, str]]] = {
+    "aws": _validate_aws_key,
+    "jwt": _validate_jwt,
+    "github": _validate_github_pat,
+    "stripe": _validate_stripe,
+    "slack": _validate_slack,
+    "anthropic": _validate_anthropic,
+    "openai": _validate_openai,
+    "google": _validate_google,
+    "private-key": _validate_private_key,
+    "sendgrid": _validate_sendgrid,
+    "npm": _validate_npm,
+    "telegram": _validate_telegram,
+    "supabase": _validate_supabase,
+}
+
+
+def _compile_patterns() -> List[Dict[str, Any]]:
+    compiled: List[Dict[str, Any]] = []
+    for spec in PATTERNS:
+        flags = re.IGNORECASE if spec.get("case_insensitive") else 0
+        try:
+            regex = re.compile(spec["regex"], flags)
+        except re.error as exc:                       # pragma: no cover - guard
+            print(f"{R}Pattern error in '{spec['name']}': {exc}{X}")
+            continue
+        ctx = spec.get("context")
+        compiled.append({
+            **spec,
+            "compiled": regex,
+            "context_compiled": re.compile(ctx, re.IGNORECASE) if ctx else None,
+            "hint": spec.get("hint"),
+            "validator": VALIDATORS.get(spec.get("validator")),
+        })
+    return compiled
+
+
+COMPILED = _compile_patterns()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════════════
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+
+def human_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}"
+        n /= 1024
+    return f"{n:.1f}PB"
+
+
+def redact(value: str, keep: int = 4) -> str:
+    """Mask the middle of a secret, keeping a short recognisable prefix."""
+    n = len(value)
+    if n <= keep * 2:
+        return "*" * n
+    return value[:keep] + "*" * (n - keep * 2) + value[-keep:]
+
+
+def should_redact(value: str) -> bool:
+    """PEM headers are safe to show in full; the body is not."""
+    return not (value.startswith("-----") and value.endswith("-----"))
+
+
+def shannon_entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    counts = Counter(s)
+    n = len(s)
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
+def looks_like_hash(s: str) -> bool:
+    return bool(re.fullmatch(r"[a-fA-F0-9]+", s)) and len(s) in (32, 40, 64, 96, 128)
+
+
+def looks_like_url(s: str) -> bool:
+    return s.startswith(("http://", "https://", "ftp://", "ssh://", "git://"))
+
+
+def looks_like_path(s: str) -> bool:
+    return "/" in s and not looks_like_url(s)
+
+
+def is_placeholder(s: str) -> bool:
+    low = s.lower()
+    return any(word in low for word in PLACEHOLDER_WORDS)
+
+
+def hash_secret(s: str) -> str:
+    """Stable short fingerprint used for allowlisting and de-duplication."""
+    return hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def display_path(path: str, root: Optional[str] = None) -> str:
+    try:
+        base = root or os.getcwd()
+        rel = os.path.relpath(path, base)
+        if not rel.startswith(".."):
+            return rel.replace("\\", "/")
+    except Exception:
+        pass
+    return path.replace("\\", "/")
+
+
+def safe_read_bytes(path: str, max_bytes: int) -> Optional[bytes]:
+    try:
+        if os.path.getsize(path) > max_bytes:
+            return None
+        with open(path, "rb") as fh:
+            return fh.read()
+    except Exception:
+        return None
+
+
+def decode_text(data: bytes) -> str:
+    """Decode bytes to text, transparently handling UTF-16 and BOMs."""
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            return data.decode("utf-16")
+        except Exception:
+            pass
+    if data[:3] == b"\xef\xbb\xbf":
+        try:
+            return data.decode("utf-8-sig")
+        except Exception:
+            pass
+    return data.decode("utf-8", errors="replace")
+
+
+def is_binary(data: bytes) -> bool:
+    return b"\x00" in data[:2048]
+
+
+# ── allowlist ─────────────────────────────────────────────────────────
+def load_allowlist() -> Set[str]:
+    entries: Set[str] = set()
+    for path in (ALLOWLIST_FILE, LOCAL_ALLOWLIST):
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        entries.add(line)
+        except Exception:
+            pass
+    return entries
+
+
+def save_allowlist(entries: Set[str], path: Optional[str] = None) -> None:
+    path = path or ALLOWLIST_FILE
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("# Gravion Secret Sniper allowlist\n")
+        fh.write("# entries: 16-char hash, pattern name, or regex:...\n\n")
+        for entry in sorted(entries):
+            fh.write(entry + "\n")
+
+
+def load_path_ignores() -> List[str]:
+    """Glob-ish path patterns from .gravionignore (one per line, # comments)."""
+    patterns: List[str] = []
+    if not os.path.exists(LOCAL_ALLOWLIST):
+        return patterns
+    try:
+        with open(LOCAL_ALLOWLIST, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#") and not line.startswith("regex:"):
+                    patterns.append(line)
+    except Exception:
+        pass
+    return patterns
+
+
+def path_is_ignored(path: str, patterns: Sequence[str]) -> bool:
+    if not patterns:
+        return False
+    normalised = path.replace("\\", "/")
+    for pat in patterns:
+        p = pat.rstrip("/")
+        if not p:
+            continue
+        if normalised == p or normalised.endswith("/" + p):
+            return True
+        if p.endswith("*") and normalised.split("/")[-1].startswith(p[:-1]):
+            return True
+    return False
+
+
+# ── entropy heuristics ────────────────────────────────────────────────
+def entropy_scan(line: str, min_entropy: float = 4.2) -> List[Tuple[str, float]]:
+    """Find high-entropy strings sitting next to a secret-ish keyword."""
+    results: List[Tuple[str, float]] = []
+    for ma
