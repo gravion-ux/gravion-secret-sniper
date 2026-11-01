@@ -1,0 +1,46 @@
+           name = input(f"{W}Scan name: {X}").strip()
+            if not name:
+                continue
+            fmt = input(f"{W}Format [sarif/json/csv/html]: {X}").strip() or "sarif"
+            out = input(f"{W}Output file (blank auto): {X}").strip() or None
+            cmd_export(argparse.Namespace(name=name, format=fmt, out=out))
+        elif choice == "7":
+            cmd_list(argparse.Namespace())
+        elif choice == "8":
+            name = input(f"{W}Scan name: {X}").strip()
+            if name:
+                cmd_show(argparse.Namespace(name=name))
+        elif choice == "9":
+            name = input(f"{W}Scan name: {X}").strip()
+            if name:
+                cmd_clear(argparse.Namespace(name=name))
+        elif choice == "10":
+            action = input(f"{W}Action [list/add/remove]: {X}").strip() or "list"
+            value = None
+            if action in ("add", "remove"):
+                value = input(f"{W}Value (hash / pattern name / regex:...): {X}").strip()
+            cmd_ignore(argparse.Namespace(action=action, value=value))
+        elif choice == "11":
+            name = input(f"{W}Scan name: {X}").strip()
+            if name:
+                cmd_verify(argparse.Namespace(name=name))
+        elif choice == "12":
+            cmd_selftest(argparse.Namespace())
+        elif choice == "13":
+            print(f"\n{GR}Bye.{X}\n")
+            return
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════════════
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="gravion_secret_sniper",
+        description=f"{TOOL_NAME} — by {AUTHOR_NAME} ({AUTHOR_HANDLE})",
+        epilog=f"Telegram: {TELEGRAM_LINK}  |  GitHub: {GITHUB_LINK}",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="cmd")
+
+    scan = sub.add_parser("scan", help="scan a file / directory / 
