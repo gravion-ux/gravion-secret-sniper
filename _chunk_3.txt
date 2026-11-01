@@ -1,0 +1,56 @@
+   return os.path.getsize(path)"),
+    ("normal", 'print("Hello, world!")'),
+]
+
+
+def cmd_selftest(args: argparse.Namespace) -> int:
+    """Validate the detection engine against known positive/negative samples."""
+    scanner = SecretScanner(redact_mode=True, entropy=False, min_severity="LOW")
+    passed = 0
+    failed: List[str] = []
+
+    print()
+    print(f"{R}{'=' * 64}{X}")
+    print(f"  {B}{W}SELFTEST{X} · {TOOL_NAME} v{TOOL_VERSION}")
+    print(f"{R}{'=' * 64}{X}")
+
+    print(f"\n  {W}Positives (must detect):{X}")
+    for category, sample in SELFTEST_POSITIVES:
+        hits = scanner.scan_text(sample, source="<selftest>")
+        matched = any(h["category"] == category for h in hits)
+        ok = matched or (category == "generic" and bool(hits))
+        if ok:
+            passed += 1
+            print(f"    {G}PASS{X} [{category:<12}] {sample[:52]}")
+        else:
+            failed.append(f"positive[{category}]: {sample[:60]}")
+            print(f"    {R}FAIL{X} [{category:<12}] {sample[:52]}")
+
+    print(f"\n  {W}Negatives (must not trigger):{X}")
+    for label, sample in SELFTEST_NEGATIVES:
+        hits = scanner.scan_text(sample, source="<selftest>")
+        bad = [h for h in hits if h["severity"] in ("CRITICAL", "HIGH")]
+        if not bad:
+            passed += 1
+            print(f"    {G}PASS{X} [{label:<12}] {sample[:52]}")
+        else:
+            failed.append(f"negative[{label}]: {sample[:60]}")
+            print(f"    {R}FAIL{X} [{label:<12}] "
+                  f"-> {', '.join(h['pattern'] for h in bad)}")
+
+    total = len(SELFTEST_POSITIVES) + len(SELFTEST_NEGATIVES)
+    print()
+    print(f"{R}{'=' * 64}{X}")
+    if failed:
+        print(f"  {R}SELFTEST FAILED{X}  {passed}/{total} passed")
+        for item in failed:
+            print(f"    {R}-{X} {item}")
+        print(f"{R}{'=' * 64}{X}")
+        footer()
+        return 1
+
+    print(f"  {G}SELFTEST PASSED{X}  {passed}/{total} checks")
+    print(f"{R}{'=' * 64}{X}")
+    footer()
+    return 0
+
