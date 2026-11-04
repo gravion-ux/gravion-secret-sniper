@@ -1,4 +1,4 @@
-# Gravion Secret Sniper has no required runtime dependencies.
+# Secret Sniper has no required runtime dependencies.
 #
 # Optional: install 'requests' to enable live credential verification
 # (the `scan --verify` flag and the `verify` subcommand).
