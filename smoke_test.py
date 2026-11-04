@@ -1,4 +1,4 @@
-"""Functional smoke test for the Gravion Secret Sniper CLI.
+"""Functional smoke test for the Secret Sniper CLI.
 
 Fixtures are generated at runtime inside a temporary directory so that no
 credential-shaped string is ever committed to the repository.
@@ -11,7 +11,27 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TOOL = os.path.join(HERE, "gravion_secret_sniper.py")
+
+
+def _tool_path():
+    """Locate the CLI entry point."""
+    candidate = os.path.join(HERE, "secret_sniper.py")
+    if os.path.exists(candidate):
+        return candidate
+    raise FileNotFoundError("secret_sniper.py not found next to smoke_test.py")
+
+
+def scans_dir():
+    """Locate the saved-scan directory across the pre/post-rename names."""
+    home = os.path.expanduser("~")
+    for name in (".secret_sniper", ".gravion_sniper"):
+        path = os.path.join(home, name, "scans")
+        if os.path.isdir(path):
+            return path
+    return os.path.join(home, ".secret_sniper", "scans")
+
+
+TOOL = _tool_path()
 
 
 def _frag(*parts):
@@ -86,13 +106,13 @@ def check(label, condition, detail=""):
 
 
 print("=" * 66)
-print("SMOKE TEST · Gravion Secret Sniper")
+print("SMOKE TEST · Secret Sniper")
 print("=" * 66)
 
 # 1. selftest
 r = run("selftest")
 check("selftest exits 0", r.returncode == 0, r.stdout[-400:])
-check("selftest reports 25/25", "25/25" in r.stdout)
+check("selftest reports 61/61", "61/61" in r.stdout)
 
 # 2. scan a directory
 with tempfile.TemporaryDirectory() as tmp:
@@ -109,7 +129,7 @@ with tempfile.TemporaryDirectory() as tmp:
             sarif = json.load(fh)
         check("sarif version 2.1.0", sarif.get("version") == "2.1.0")
         driver = sarif["runs"][0]["tool"]["driver"]
-        check("sarif driver branded", driver["name"] == "Gravion Secret Sniper",
+        check("sarif driver branded", driver["name"] == "Secret Sniper",
               driver.get("name", ""))
         check("sarif has results", len(sarif["runs"][0]["results"]) > 0)
         rules = driver["rules"]
@@ -123,8 +143,7 @@ with tempfile.TemporaryDirectory() as tmp:
     check("show works", r.returncode == 0 and "SECRET SCAN" in r.stdout)
 
     # 4. raw secrets must NOT be persisted to disk
-    home_scan = os.path.join(os.path.expanduser("~"), ".gravion_sniper", "scans",
-                             "smoke_scan.json")
+    home_scan = os.path.join(scans_dir(), "smoke_scan.json")
     if os.path.exists(home_scan):
         with open(home_scan, encoding="utf-8") as fh:
             saved = json.load(fh)
@@ -143,7 +162,7 @@ with tempfile.TemporaryDirectory() as tmp:
     if os.path.exists(os.path.join(tmp, "o.html")):
         with open(os.path.join(tmp, "o.html"), encoding="utf-8") as fh:
             html = fh.read()
-        check("html branded", "Gravion Secret Sniper" in html)
+        check("html branded", "Secret Sniper" in html)
         check("html author", "Priyanshu Kumar Thakur" in html)
 
     # 6. fail-on exit code
@@ -175,8 +194,7 @@ with tempfile.TemporaryDirectory() as tmp:
                     "GITHUB_TOKEN=" + GH_TOKEN + "\n")
     r = run("scan", zpath, "--name", "smoke_zip", "-q", cwd=tmp)
     check("archive scan exits 0", r.returncode == 0, r.stderr[-300:])
-    zip_report = os.path.join(os.path.expanduser("~"), ".gravion_sniper",
-                              "scans", "smoke_zip.json")
+    zip_report = os.path.join(scans_dir(), "smoke_zip.json")
     if os.path.exists(zip_report):
         with open(zip_report, encoding="utf-8") as fh:
             zdata = json.load(fh)
@@ -205,8 +223,7 @@ with tempfile.TemporaryDirectory() as tmp:
                    env=env, capture_output=True)
     r = run("scan", repo, "--history", "--name", "smoke_git", "-q", cwd=tmp)
     check("git history scan exits 0", r.returncode == 0, r.stderr[-300:])
-    git_report = os.path.join(os.path.expanduser("~"), ".gravion_sniper",
-                              "scans", "smoke_git.json")
+    git_report = os.path.join(scans_dir(), "smoke_git.json")
     if os.path.exists(git_report):
         with open(git_report, encoding="utf-8") as fh:
             gdata = json.load(fh)
@@ -217,6 +234,130 @@ with tempfile.TemporaryDirectory() as tmp:
               str(gdata.get("commits_scanned")))
     else:
         check("git report saved", False)
+
+# 12. help command
+r = run("help")
+check("help exits 0", r.returncode == 0, r.stderr[-300:])
+check("help prints the banner",
+      "SECRET" in r.stdout.upper() and "SNIPER" in r.stdout.upper())
+check("help lists every command",
+      all(cmd in r.stdout for cmd in ("scan", "url", "verify", "export",
+                                      "ignore", "selftest")),
+      r.stdout[:300])
+
+r = run("help", "scan")
+check("help <command> shows detail",
+      r.returncode == 0 and "scan" in r.stdout.lower(), r.stdout[:200])
+
+# 13. a bare invocation prints usage instead of dropping into a menu
+r = run()
+check("bare run exits 0", r.returncode == 0, r.stderr[-300:])
+check("bare run prints usage", "url" in r.stdout, r.stdout[:200])
+
+# 14. url scan: page, assets, crawl and sensitive-path recon
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+WEB_STRIPE = "sk_live_" + "51H8" + "xYzabcdefghij" + "klmnop"
+WEB_GITHUB = "ghp_" + "a1B2c3D4e5F6" + "g7H8i9J0k1L2" + "m3N4o5P6q7R8"
+WEB_AWS = "AKIAIOSF" + "ODNN7EXAMPLE"
+
+INDEX_HTML = (
+    "<!doctype html><html><head><title>fixture</title>"
+    "<script src=\"/app.js\"></script></head><body>"
+    "<a href=\"/page2\">second</a>"
+    "<script>var stripeKey = \"" + WEB_STRIPE + "\";</script>"
+    "</body></html>"
+)
+APP_JS = "const stripe = \"" + WEB_STRIPE + "\";\n"
+PAGE2_HTML = ("<html><body><script>var aws = \"" + WEB_AWS + "\";</script>"
+              "</body></html>")
+ENV_BODY = "GITHUB_TOKEN=" + WEB_GITHUB + "\n"
+
+
+class _WebFixtureHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def _send(self, code, body, ctype):
+        raw = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path == "/":
+            self._send(200, INDEX_HTML, "text/html; charset=utf-8")
+        elif path == "/app.js":
+            self._send(200, APP_JS, "application/javascript")
+        elif path == "/page2":
+            self._send(200, PAGE2_HTML, "text/html; charset=utf-8")
+        elif path == "/.env":
+            self._send(200, ENV_BODY, "text/plain; charset=utf-8")
+        elif path == "/robots.txt":
+            self._send(200, "User-agent: *\n", "text/plain")
+        elif path == "/clean":
+            self._send(200, "<html><body><p>nothing to see</p></body></html>",
+                       "text/html; charset=utf-8")
+        else:
+            self._send(404, "not found", "text/plain")
+
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), _WebFixtureHandler)
+port = server.server_address[1]
+threading.Thread(target=server.serve_forever, daemon=True).start()
+BASE_URL = f"http://127.0.0.1:{port}"
+
+try:
+    r = run("url", BASE_URL, "--name", "smoke_url", "--crawl", "1", "-q")
+    check("url scan exits 0", r.returncode == 0, r.stderr[-500:])
+    url_report = os.path.join(scans_dir(), "smoke_url.json")
+    check("url report saved", os.path.exists(url_report), url_report)
+    if os.path.exists(url_report):
+        with open(url_report, encoding="utf-8") as fh:
+            udata = json.load(fh)
+        sources = [f.get("file", "") for f in udata.get("findings", [])]
+        check("url scan found the script asset secret",
+              any("/app.js" in s for s in sources), str(sources))
+        check("url scan found the exposed .env secret",
+              any("/.env" in s for s in sources), str(sources))
+        check("url scan crawled a linked page",
+              any("/page2" in s for s in sources), str(sources))
+        recon = udata.get("recon", [])
+        check("url scan recorded recon results",
+              any(p.get("path") == "/.env" for p in recon), str(recon))
+        check("url scan flagged the exposed .env",
+              any(p.get("path") == "/.env" and p.get("exposed")
+                  for p in recon), str(recon))
+        check("url scan reports a robots.txt hit",
+              any(p.get("path") == "/robots.txt" for p in recon), str(recon))
+
+    # a url scan that finds nothing must still render and exit cleanly
+    r = run("url", BASE_URL + "/clean", "--no-recon", "--name", "smoke_url_clean")
+    check("clean url scan exits 0", r.returncode == 0, r.stderr[-500:])
+    check("clean url scan prints no-secrets message",
+          "No secrets detected" in r.stdout, r.stdout[-300:])
+    check("clean url scan has no traceback",
+          "Traceback" not in r.stderr, r.stderr[-500:])
+finally:
+    server.shutdown()
+    server.server_close()
+
+# 15. a scan with zero findings must render and exit cleanly
+with tempfile.TemporaryDirectory() as tmp:
+    clean_dir = os.path.join(tmp, "clean")
+    os.makedirs(clean_dir)
+    with open(os.path.join(clean_dir, "hello.txt"), "w", encoding="utf-8") as fh:
+        fh.write("hello world\nnothing sensitive in here\n")
+    r = run("scan", clean_dir, "--name", "smoke_clean", cwd=tmp)
+    check("clean scan exits 0", r.returncode == 0, r.stderr[-500:])
+    check("clean scan prints no-secrets message",
+          "No secrets detected" in r.stdout, r.stdout[-300:])
+    check("clean scan has no traceback",
+          "Traceback" not in r.stderr, r.stderr[-500:])
 
 print()
 print("=" * 66)
