@@ -1,6 +1,6 @@
 # Secret Sniper
 
-> Leak detection for credentials — static analysis, entropy analysis, **single-site scanning** and **live credential verification**.
+> Leak detection for credentials — static analysis, entropy analysis, **single-site scanning**, **bulk URL-list scanning** and **live credential verification**.
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -29,12 +29,14 @@ for live verification.
 ## What it does
 
 Secret Sniper finds leaked API keys, tokens, passwords and private keys across files,
-directories, **archives**, **encoded payloads**, **full git history** and **live websites** —
-then optionally contacts each credential's own provider to find out whether it is still **live**.
+directories, **archives**, **encoded payloads**, **full git history**, **live websites** and
+**whole lists of URLs** — then optionally contacts each credential's own provider to find
+out whether it is still **live**.
 
 | Capability | Detail |
 |---|---|
 | **Single-site scanning** | `url` fetches a page, scans the HTML, every inline script and every referenced JS/CSS bundle, then probes sensitive paths |
+| **Bulk URL-list scanning** | `urls list.txt` (and `scan` on a `.txt` that is mostly URLs) visits every target concurrently, and counts every one of them — reachable or not |
 | **Pattern detection** | 120+ rules across cloud, AI/LLM, payments, CI/CD, databases, messaging and SaaS |
 | **Structural validation** | AWS key prefixes, JWT header/payload decoding, Stripe/OpenAI/Slack/Supabase shapes — false positives die early |
 | **Entropy analysis** | Shannon-entropy sweep with keyword proximity scoring and placeholder rejection |
@@ -113,6 +115,59 @@ no bruteforce. Findings land in a normal saved scan, so `list`, `show`, `export`
 Useful flags: `--crawl N`, `--no-recon`, `--max-assets N`, `--timeout S`,
 `--user-agent "..."`, `--header "Name: value"` (repeatable), `--only aws,stripe`,
 `--min-severity HIGH`, `--verify`, `--fail-on CRITICAL`, `--name`, `-e/--export`, `-o/--out`.
+
+---
+
+## Scan a list of URLs
+
+Got a `.txt` with thousands of URLs in it? Point Secret Sniper at the file and it
+visits **every** target, exactly the way `url` visits one site — page, inline scripts,
+JS/CSS bundles — but concurrently.
+
+```bash
+# every URL in the file, scanned in parallel
+python secret_sniper.py urls targets.txt
+
+# more workers, shorter per-request timeout
+python secret_sniper.py urls targets.txt -t 32 --timeout 8
+
+# also probe the sensitive paths on each target (8 extra requests per target)
+python secret_sniper.py urls targets.txt --recon
+
+# stop after the first 500 targets
+python secret_sniper.py urls targets.txt --max-urls 500
+
+# export the result like any other scan
+python secret_sniper.py urls targets.txt --name bulk -e sarif -o bulk.sarif
+```
+
+`scan` does the same thing automatically. A file that is **mostly** http(s) URLs is
+treated as a list of targets rather than as a file to grep, so the command you already
+know now does the right thing:
+
+```bash
+python secret_sniper.py scan targets.txt
+```
+
+The list file itself is scanned as well, so a credential pasted next to a URL is still
+caught. If you want the old plain-file behaviour for a specific file, say so:
+
+```bash
+python secret_sniper.py scan targets.txt --no-url-list
+```
+
+Every target is counted, reachable or not, and the report records how many answered:
+
+| Field | Meaning |
+|---|---|
+| `targets_total` | URLs read from the list |
+| `targets_unique` | distinct URLs actually visited |
+| `targets_ok` | targets that answered |
+| `targets_failed` | targets that did not answer (timeout, DNS, refused) |
+
+Useful flags: `-t/--threads` (default 20), `--timeout S` (default 10), `--crawl N`,
+`--max-assets N`, `--recon`, `--max-urls N`, `--only`, `--min-severity`, `--verify`,
+`--fail-on`, `--name`, `-e/--export`, `-o/--out`.
 
 ---
 
@@ -279,8 +334,8 @@ Use `--only` to scope a scan to specific categories.
 ## Testing
 
 ```bash
-python secret_sniper.py selftest    # 61 engine assertions
-python smoke_test.py                 # 47 end-to-end CLI checks
+python secret_sniper.py selftest    # 69 engine assertions
+python smoke_test.py                 # 69 end-to-end CLI checks
 ```
 
 The self-test asserts that 17 known credential formats are detected, that 8 common

@@ -112,7 +112,7 @@ print("=" * 66)
 # 1. selftest
 r = run("selftest")
 check("selftest exits 0", r.returncode == 0, r.stdout[-400:])
-check("selftest reports 61/61", "61/61" in r.stdout)
+check("selftest reports 69/69", "69/69" in r.stdout)
 
 # 2. scan a directory
 with tempfile.TemporaryDirectory() as tmp:
@@ -241,7 +241,7 @@ check("help exits 0", r.returncode == 0, r.stderr[-300:])
 check("help prints the banner",
       "SECRET" in r.stdout.upper() and "SNIPER" in r.stdout.upper())
 check("help lists every command",
-      all(cmd in r.stdout for cmd in ("scan", "url", "verify", "export",
+      all(cmd in r.stdout for cmd in ("scan", "url", "urls", "verify", "export",
                                       "ignore", "selftest")),
       r.stdout[:300])
 
@@ -302,6 +302,10 @@ class _WebFixtureHandler(BaseHTTPRequestHandler):
         elif path == "/clean":
             self._send(200, "<html><body><p>nothing to see</p></body></html>",
                        "text/html; charset=utf-8")
+        elif path.startswith("/p/"):
+            self._send(200, "<html><body><p>stripe = \"" + WEB_STRIPE
+                       + "\"</p><p>aws = \"" + WEB_AWS + "\"</p></body></html>",
+                       "text/html; charset=utf-8")
         else:
             self._send(404, "not found", "text/plain")
 
@@ -342,11 +346,119 @@ try:
           "No secrets detected" in r.stdout, r.stdout[-300:])
     check("clean url scan has no traceback",
           "Traceback" not in r.stderr, r.stderr[-500:])
+
+    # 15. bulk URL-list scanning: a .txt of URLs is a list of *targets*.
+    #     Scanning the text alone used to report a few dozen incidental
+    #     matches instead of the hundreds really exposed on those sites.
+    BULK_TARGETS = 12
+    with tempfile.TemporaryDirectory() as tmp:
+        list_path = os.path.join(tmp, "targets.txt")
+        with open(list_path, "w", encoding="utf-8") as fh:
+            for i in range(BULK_TARGETS):
+                fh.write(BASE_URL + "/p/" + str(i) + "\n")
+
+        r = run("scan", list_path, "--name", "smoke_bulk", "-q", cwd=tmp)
+        check("bulk scan exits 0", r.returncode == 0, r.stderr[-500:])
+        bulk_report = os.path.join(scans_dir(), "smoke_bulk.json")
+        check("bulk report saved", os.path.exists(bulk_report), bulk_report)
+        if os.path.exists(bulk_report):
+            with open(bulk_report, encoding="utf-8") as fh:
+                bdata = json.load(fh)
+            check("bulk scan reports kind url-list",
+                  bdata.get("kind") == "url-list", str(bdata.get("kind")))
+            check("bulk scan visited every target",
+                  bdata.get("targets_unique") == BULK_TARGETS,
+                  str(bdata.get("targets_unique")))
+            check("bulk scan counted no unreachable target",
+                  bdata.get("targets_failed") == 0,
+                  str(bdata.get("targets_failed")))
+            sources = [f.get("file", "") for f in bdata.get("findings", [])]
+            check("bulk scan found secrets on the fetched pages",
+                  any("/p/" in s for s in sources), str(sources[:5]))
+            aws_hits = sum(1 for f in bdata.get("findings", [])
+                           if f.get("pattern") == "AWS Access Key ID")
+            check("bulk scan found the AWS key on every page",
+                  aws_hits == BULK_TARGETS, str(aws_hits))
+            check("bulk scan found the stripe key",
+                  any(f.get("pattern") == "Stripe Live Secret Key"
+                      for f in bdata.get("findings", [])), "")
+
+        # the explicit `urls` command must do the same
+        r = run("urls", list_path, "--name", "smoke_urls", "-q", cwd=tmp)
+        check("urls command exits 0", r.returncode == 0, r.stderr[-500:])
+        urls_report = os.path.join(scans_dir(), "smoke_urls.json")
+        check("urls report saved", os.path.exists(urls_report), urls_report)
+        if os.path.exists(urls_report):
+            with open(urls_report, encoding="utf-8") as fh:
+                udata2 = json.load(fh)
+            check("urls command visited every target",
+                  udata2.get("targets_unique") == BULK_TARGETS,
+                  str(udata2.get("targets_unique")))
+            check("urls command found the secrets",
+                  any(f.get("pattern") == "Stripe Live Secret Key"
+                      for f in udata2.get("findings", [])), "")
+
+        # --max-urls caps how many targets are visited
+        r = run("urls", list_path, "--max-urls", "3", "--name", "smoke_urls_cap",
+                "-q", cwd=tmp)
+        cap_report = os.path.join(scans_dir(), "smoke_urls_cap.json")
+        check("max-urls report saved", os.path.exists(cap_report))
+        if os.path.exists(cap_report):
+            with open(cap_report, encoding="utf-8") as fh:
+                cdata = json.load(fh)
+            check("max-urls caps the target count",
+                  cdata.get("targets_unique") == 3,
+                  str(cdata.get("targets_unique")))
+
+        # a bulk report exports to SARIF like any other scan
+        sarif_bulk = os.path.join(tmp, "bulk.sarif")
+        r = run("urls", list_path, "--name", "smoke_urls_sarif", "-q",
+                "-e", "sarif", "-o", sarif_bulk, cwd=tmp)
+        check("bulk sarif exported", os.path.exists(sarif_bulk))
+        if os.path.exists(sarif_bulk):
+            with open(sarif_bulk, encoding="utf-8") as fh:
+                bsarif = json.load(fh)
+            check("bulk sarif has results",
+                  len(bsarif["runs"][0]["results"]) > 0,
+                  str(len(bsarif["runs"][0]["results"])))
+
+        # --no-url-list keeps the plain-file behaviour
+        r = run("scan", list_path, "--no-url-list", "--name", "smoke_bulk_off",
+                "-q", cwd=tmp)
+        off_report = os.path.join(scans_dir(), "smoke_bulk_off.json")
+        check("no-url-list report saved", os.path.exists(off_report))
+        if os.path.exists(off_report):
+            with open(off_report, encoding="utf-8") as fh:
+                odata = json.load(fh)
+            check("no-url-list stays a plain file scan",
+                  odata.get("kind") == "file", str(odata.get("kind")))
+            check("no-url-list fetches no targets",
+                  not odata.get("targets_unique"),
+                  str(odata.get("targets_unique")))
+
+    # a normal .txt that merely mentions one URL stays a plain file scan
+    with tempfile.TemporaryDirectory() as tmp:
+        mixed = os.path.join(tmp, "notes.txt")
+        with open(mixed, "w", encoding="utf-8") as fh:
+            fh.write("GITHUB_TOKEN=" + GH_TOKEN + "\n")
+            fh.write("see " + BASE_URL + " for details\n")
+        r = run("scan", mixed, "--name", "smoke_mixed", "-q", cwd=tmp)
+        mixed_report = os.path.join(scans_dir(), "smoke_mixed.json")
+        check("mixed file report saved", os.path.exists(mixed_report))
+        if os.path.exists(mixed_report):
+            with open(mixed_report, encoding="utf-8") as fh:
+                mdata = json.load(fh)
+            check("mixed file stays a plain file scan",
+                  mdata.get("kind") == "file", str(mdata.get("kind")))
+            check("mixed file still finds its own secret",
+                  any("GitHub" in f.get("pattern", "")
+                      for f in mdata.get("findings", [])),
+                  str([f.get("pattern") for f in mdata.get("findings", [])]))
 finally:
     server.shutdown()
     server.server_close()
 
-# 15. a scan with zero findings must render and exit cleanly
+# 16. a scan with zero findings must render and exit cleanly
 with tempfile.TemporaryDirectory() as tmp:
     clean_dir = os.path.join(tmp, "clean")
     os.makedirs(clean_dir)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SECRET SNIPER v2.1.0
+SECRET SNIPER v2.2.0
 Leaked credential detection & live verification.
 
 Author   : Priyanshu Kumar Thakur (@pkt_143)
@@ -16,6 +16,7 @@ Detection and verification only - no exploitation.
 Commands:
   scan TARGET          scan file / folder / archive / repo / stdin
   url URL              scan one website: page, JS assets, crawl, recon
+  urls LIST            scan every URL listed in a file
   verify NAME          live-check the credentials in a saved scan
   export NAME -f F     export sarif / json / csv / html
   list | show | clear  manage saved scans
@@ -44,6 +45,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -67,7 +69,7 @@ TELEGRAM_LINK = "https://t.me/pkt_143"
 GITHUB_LINK = "https://github.com/gravion-ux"
 REPO_LINK = "https://github.com/gravion-ux/secret-sniper"
 TOOL_NAME = "Secret Sniper"
-TOOL_VERSION = "2.1.0"
+TOOL_VERSION = "2.2.0"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1317,7 +1319,20 @@ class SecretScanner:
         self.only_cats = only_cats
         self.min_rank = SEV_ORDER.get(min_severity.upper(), 3)
         # Guards against unbounded recursion when scanning decoded payloads.
+        # The guard is per-thread: when one instance is shared across many
+        # workers, a shared counter would let one worker's encoded-payload
+        # scan suppress every other worker's encoded-secret detection.
+        self._state = threading.local()
         self._depth = 0
+
+    @property
+    def _depth(self) -> int:
+        """Recursion depth of the calling thread."""
+        return getattr(self._state, "depth", 0)
+
+    @_depth.setter
+    def _depth(self, value: int) -> None:
+        self._state.depth = value
 
     # ── allowlist ──────────────────────────────────────────────────────
     def _is_allowlisted(self, pattern_name: str, value: str) -> bool:
@@ -1938,20 +1953,33 @@ def verify_secret(pattern: str, value: str, timeout: int = 10) -> Tuple[str, str
 
 def verify_findings(findings: List[Dict], timeout: int = 10,
                     verbose: bool = True) -> List[Dict]:
-    """Verify every finding that still carries its raw value."""
+    """Verify every finding that still carries its raw value.
+
+    One credential is often exposed on many pages of the same site, and a
+    bulk URL scan can surface the same secret thousands of times. Each
+    distinct secret is therefore checked against its issuer once, and that
+    verdict is shared by every finding carrying it.
+    """
     verified: List[Dict] = []
+    verdicts: Dict[Tuple[str, str], Tuple[str, str]] = {}
     for finding in findings:
         raw = finding.get("_raw")
         if not raw:
             verified.append({**finding, "live_status": "SKIPPED",
                              "live_detail": "raw value not retained (redacted scan)"})
             continue
-        status, detail = verify_secret(finding["pattern"], raw, timeout=timeout)
-        enriched = {**finding, "live_status": status, "live_detail": detail}
-        verified.append(enriched)
-        if verbose:
-            colour = {"LIVE": R + B, "DEAD": GR, "UNKNOWN": Y, "SKIPPED": GR}.get(status, Y)
-            print(f"  {colour}{status:<8}{X} {finding['pattern']}  {GR}{detail}{X}")
+        key = (finding["pattern"], finding.get("hash", ""))
+        if key not in verdicts:
+            status, detail = verify_secret(finding["pattern"], raw, timeout=timeout)
+            verdicts[key] = (status, detail)
+            if verbose:
+                colour = {"LIVE": R + B, "DEAD": GR, "UNKNOWN": Y,
+                          "SKIPPED": GR}.get(status, Y)
+                print(f"  {colour}{status:<8}{X} {finding['pattern']}  "
+                      f"{GR}{detail}{X}")
+        status, detail = verdicts[key]
+        verified.append({**finding, "live_status": status,
+                         "live_detail": detail})
     return verified
 
 
@@ -2111,41 +2139,99 @@ def parse_html(text: str, base_url: str) -> Dict[str, List[str]]:
     }
 
 
-def scan_url(url: str, crawl: int = 0, max_assets: int = 25, timeout: int = 15,
-             user_agent: Optional[str] = None,
-             headers: Optional[Dict[str, str]] = None, recon: bool = True,
-             only: Optional[str] = None, min_severity: str = "LOW",
-             no_entropy: bool = False, no_redact: bool = False,
-             allowlist: Optional[Set[str]] = None, min_entropy: float = 4.2,
-             decode_encoded: bool = True, name: Optional[str] = None,
-             verbose: bool = True,
-             max_bytes: int = 5 * 1024 * 1024) -> Optional[Dict]:
-    """Scan a single website for exposed credentials.
+# ── URL lists ─────────────────────────────────────────────────────────
+# A .txt file holding thousands of URLs is a list of *targets* to visit,
+# not a file whose text happens to contain secrets. Scanning the text alone
+# only ever reports credentials that happen to sit inside the URL strings,
+# which is why a 9000-URL list used to come back with a few dozen hits
+# instead of the hundreds really exposed on those sites.
+URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
-    Fetches the page, scans the HTML and every inline script, downloads the
-    referenced JavaScript/CSS assets, optionally crawls same-host pages, and
-    probes sensitive paths. Read-only GET requests only.
+# A file has to look overwhelmingly like a list before it is treated as one,
+# so an ordinary source file that happens to mention a few links keeps its
+# normal file-scanning behaviour.
+URL_LIST_MIN_LINES = 5
+URL_LIST_MIN_RATIO = 0.6
+
+_URL_TRAILING = ".,;:!?\"'<>"
+_URL_CLOSERS = {")": "(", "]": "[", "}": "{"}
+
+
+def _clean_url(url: str) -> str:
+    """Trim punctuation that belongs to the surrounding text, not the URL."""
+    url = url.rstrip(_URL_TRAILING)
+    changed = True
+    while changed and url:
+        changed = False
+        last = url[-1]
+        opener = _URL_CLOSERS.get(last)
+        if opener and url.count(last) > url.count(opener):
+            url = url[:-1]
+            changed = True
+    return url
+
+
+def extract_urls(text: str) -> List[str]:
+    """Return every http(s) URL in `text`, in order of appearance.
+
+    Blank lines and `#` comments are ignored. A URL sitting inside a longer
+    line (a CSV cell, a log line) is picked up as well.
     """
-    started = now_iso()
-    begin = time.time()
+    urls: List[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        for match in URL_RE.finditer(stripped):
+            url = _clean_url(match.group(0))
+            if url:
+                urls.append(url)
+    return urls
 
+
+def looks_like_url_list(text: str) -> bool:
+    """True when `text` is predominantly a list of http(s) URLs."""
+    meaningful = [line.strip() for line in text.splitlines()]
+    meaningful = [line for line in meaningful
+                  if line and not line.startswith("#")]
+    if not meaningful:
+        return False
+    url_lines = sum(1 for line in meaningful if URL_RE.search(line))
+    if url_lines < URL_LIST_MIN_LINES:
+        return False
+    return (url_lines / len(meaningful)) >= URL_LIST_MIN_RATIO
+
+
+def _read_text_file(path: str, max_bytes: int) -> str:
+    """Read a file as text, or return an empty string if it is not text."""
+    data = safe_read_bytes(path, max_bytes)
+    if data is None or is_binary(data):
+        return ""
+    return decode_text(data)
+
+
+def fetch_target(url: str, scanner: SecretScanner, crawl: int = 0,
+                 max_assets: int = 25, timeout: int = 15,
+                 headers: Optional[Dict[str, str]] = None,
+                 user_agent: Optional[str] = None, recon: bool = True,
+                 verbose: bool = False,
+                 max_bytes: int = 5 * 1024 * 1024) -> Dict[str, Any]:
+    """Fetch one URL and scan everything that comes back.
+
+    Reads the page, its inline scripts and its JS/CSS assets, optionally
+    crawls same-host pages and probes sensitive paths. Read-only GETs only.
+
+    Returns the findings, the sources that were read and the recon rows.
+    Never raises: a failed request comes back as status 0.
+    """
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        print(f"  {R}!{X} not a valid http(s) URL: {url}")
-        return None
-    host = parsed.netloc.lower()
+        if verbose:
+            print(f"  {R}!{X} not a valid http(s) URL: {url}")
+        return {"url": url, "status": 0, "findings": [], "sources": [],
+                "recon": [], "ok": False, "invalid": True, "error": "invalid url"}
 
-    only_cats = ({x.strip().lower() for x in only.split(",") if x.strip()}
-                 if only else None)
-    scanner = SecretScanner(
-        redact_mode=not no_redact,
-        entropy=not no_entropy,
-        allowlist=allowlist or set(),
-        only_cats=only_cats,
-        min_severity=min_severity,
-        decode_encoded=decode_encoded,
-        min_entropy=min_entropy,
-    )
+    host = parsed.netloc.lower()
 
     request_headers = dict(headers or {})
     if user_agent:
@@ -2247,6 +2333,129 @@ def scan_url(url: str, crawl: int = 0, max_assets: int = 25, timeout: int = 15,
                          if row["secrets"] else "")
                 print(f"    {mark} {path}{extra}")
 
+    return {"url": url, "status": status, "findings": findings,
+            "sources": sources, "recon": recon_rows,
+            "ok": bool(sources), "invalid": False, "error": ""}
+
+
+def scan_url_list(urls: List[str], scanner: SecretScanner, threads: int = 20,
+                  timeout: int = 10, crawl: int = 0, max_assets: int = 25,
+                  headers: Optional[Dict[str, str]] = None,
+                  user_agent: Optional[str] = None, recon: bool = False,
+                  verbose: bool = True,
+                  max_bytes: int = 5 * 1024 * 1024) -> Dict[str, Any]:
+    """Scan a list of URLs concurrently and merge every finding.
+
+    Duplicate URLs are visited once. One unreachable target can never hide
+    the others: every target is visited and counted on its own.
+    """
+    unique: List[str] = []
+    seen: Set[str] = set()
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            unique.append(url)
+
+    total = len(unique)
+    findings: List[Dict] = []
+    sources: List[str] = []
+    recon_rows: List[Dict] = []
+    ok = 0
+    failed = 0
+    done = 0
+    started = time.time()
+    step = max(1, total // 10)
+
+    def worker(url: str) -> Dict[str, Any]:
+        try:
+            return fetch_target(url, scanner, crawl=crawl,
+                                max_assets=max_assets, timeout=timeout,
+                                headers=headers, user_agent=user_agent,
+                                recon=recon, verbose=False,
+                                max_bytes=max_bytes)
+        except Exception as exc:
+            return {"url": url, "status": 0, "findings": [], "sources": [],
+                    "recon": [], "ok": False, "invalid": False,
+                    "error": type(exc).__name__}
+
+    if verbose and total:
+        print(f"{C}>> Scanning {total} target(s) · {threads} workers{X}\n")
+
+    if total:
+        with ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
+            futures = [pool.submit(worker, url) for url in unique]
+            for future in as_completed(futures):
+                done += 1
+                try:
+                    result = future.result()
+                except Exception:
+                    result = {"ok": False, "findings": [], "sources": [],
+                              "recon": []}
+                if result.get("ok"):
+                    ok += 1
+                else:
+                    failed += 1
+                findings.extend(result.get("findings", []))
+                sources.extend(result.get("sources", []))
+                recon_rows.extend(result.get("recon", []))
+                if verbose and total > 5 and (done % step == 0 or done == total):
+                    pct = done * 100 // total
+                    print(f"  {GR}[{done}/{total}] {pct}% · "
+                          f"{len(findings)} findings · {failed} unreachable{X}")
+
+    return {
+        "findings": findings,
+        "sources": sources,
+        "recon": recon_rows,
+        "targets_total": len(urls),
+        "targets_unique": total,
+        "targets_ok": ok,
+        "targets_failed": failed,
+        "duration_ms": int((time.time() - started) * 1000),
+    }
+
+
+def scan_url(url: str, crawl: int = 0, max_assets: int = 25, timeout: int = 15,
+             user_agent: Optional[str] = None,
+             headers: Optional[Dict[str, str]] = None, recon: bool = True,
+             only: Optional[str] = None, min_severity: str = "LOW",
+             no_entropy: bool = False, no_redact: bool = False,
+             allowlist: Optional[Set[str]] = None, min_entropy: float = 4.2,
+             decode_encoded: bool = True, name: Optional[str] = None,
+             verbose: bool = True,
+             max_bytes: int = 5 * 1024 * 1024) -> Optional[Dict]:
+    """Scan a single website for exposed credentials.
+
+    Fetches the page, scans the HTML and every inline script, downloads the
+    referenced JavaScript/CSS assets, optionally crawls same-host pages, and
+    probes sensitive paths. Read-only GET requests only.
+    """
+    started = now_iso()
+    begin = time.time()
+
+    only_cats = ({x.strip().lower() for x in only.split(",") if x.strip()}
+                 if only else None)
+    scanner = SecretScanner(
+        redact_mode=not no_redact,
+        entropy=not no_entropy,
+        allowlist=allowlist or set(),
+        only_cats=only_cats,
+        min_severity=min_severity,
+        decode_encoded=decode_encoded,
+        min_entropy=min_entropy,
+    )
+
+    result = fetch_target(url, scanner, crawl=crawl, max_assets=max_assets,
+                          timeout=timeout, headers=headers,
+                          user_agent=user_agent, recon=recon,
+                          verbose=verbose, max_bytes=max_bytes)
+    if result.get("invalid"):
+        return None
+
+    findings = result["findings"]
+    sources = result["sources"]
+    recon_rows = result["recon"]
+
     findings.sort(key=lambda f: (-f.get("risk", 0), f.get("file", ""),
                                  f.get("line", 0)))
     report_name = name or f"url_{stamp()}"
@@ -2317,6 +2526,119 @@ def cmd_url(args: argparse.Namespace) -> Optional[Dict]:
     if not report:
         footer()
         return None
+
+    if args.verify:
+        print(f"\n{C}>> Live verification "
+              f"(contacting each credential's provider){X}")
+        report["findings"] = verify_findings(report["findings"],
+                                             verbose=not args.quiet)
+        report["summary"] = _build_summary(report["findings"])
+        _save_report(report)
+
+    render_report(report, show_all=not args.quiet)
+
+    if args.export:
+        do_export(report, args.export, args.out)
+
+    footer()
+
+    if args.fail_on:
+        threshold = SEV_ORDER.get(args.fail_on.upper(), 3)
+        if any(SEV_ORDER.get(f["severity"], 99) <= threshold
+               for f in report["findings"]):
+            sys.exit(1)
+    return report
+
+
+def cmd_urls(args: argparse.Namespace) -> Optional[Dict]:
+    """Entry point for `secret_sniper.py urls <LIST>`.
+
+    Every URL in the list is visited and scanned, exactly as `url` would
+    scan it on its own, but concurrently. The list file itself is scanned
+    too, so a credential pasted next to a URL is still caught.
+    """
+    allowlist = load_allowlist()
+
+    if not os.path.isfile(args.list_file):
+        print(f"{R}Not found: {args.list_file}{X}")
+        footer()
+        return None
+
+    text = _read_text_file(args.list_file, 64 * 1024 * 1024)
+    urls = extract_urls(text)
+    if not urls:
+        print(f"{Y}No http(s) URLs found in {args.list_file}{X}")
+        footer()
+        return None
+    if args.max_urls and len(urls) > args.max_urls:
+        urls = urls[:args.max_urls]
+
+    only_cats = ({x.strip().lower() for x in args.only.split(",") if x.strip()}
+                 if args.only else None)
+    scanner = SecretScanner(
+        redact_mode=not args.no_redact,
+        entropy=not args.no_entropy,
+        allowlist=allowlist,
+        only_cats=only_cats,
+        min_severity=args.min_severity,
+        decode_encoded=True,
+        min_entropy=args.min_entropy,
+    )
+
+    started = now_iso()
+    begin = time.time()
+
+    bulk = scan_url_list(urls, scanner, threads=args.threads,
+                         timeout=args.timeout, crawl=args.crawl,
+                         max_assets=args.max_assets, recon=args.recon,
+                         verbose=not args.quiet)
+
+    findings = scanner.scan_text(text, source=args.list_file)
+    findings.extend(bulk["findings"])
+    findings.sort(key=lambda f: (-f.get("risk", 0), f.get("file", ""),
+                                 f.get("line", 0)))
+
+    report_name = args.name or f"urls_{stamp()}"
+    report = {
+        "name": report_name,
+        "tool": TOOL_NAME,
+        "tool_version": TOOL_VERSION,
+        "author": AUTHOR_NAME,
+        "target": args.list_file,
+        "kind": "url-list",
+        "started": started,
+        "finished": now_iso(),
+        "duration_ms": int((time.time() - begin) * 1000),
+        "history": False,
+        "files_scanned": len(bulk["sources"]) + 1,
+        "commits_scanned": 0,
+        "options": {
+            "threads": args.threads,
+            "timeout": args.timeout,
+            "crawl": args.crawl,
+            "max_assets": args.max_assets,
+            "recon": args.recon,
+            "only": args.only,
+            "min_severity": args.min_severity,
+            "no_entropy": args.no_entropy,
+            "no_redact": args.no_redact,
+            "min_entropy": args.min_entropy,
+            "url_list": "on",
+            "max_urls": args.max_urls,
+        },
+        "targets_total": bulk["targets_total"],
+        "targets_unique": bulk["targets_unique"],
+        "targets_ok": bulk["targets_ok"],
+        "targets_failed": bulk["targets_failed"],
+        "findings": findings,
+        "summary": _build_summary(findings),
+        "recon": bulk["recon"],
+        "sources": bulk["sources"],
+    }
+
+    path = _save_report(report)
+    if not args.quiet:
+        print(f"\n  {G}v{X} Saved -> {B}{path}{X}")
 
     if args.verify:
         print(f"\n{C}>> Live verification "
@@ -2619,13 +2941,32 @@ HELP_TOPICS: Dict[str, Dict[str, str]] = {
         "summary": "Scan a file, folder, archive, git repository or stdin.",
         "detail": ("TARGET is a file, a directory, a .zip/.tar archive, a git\n"
                    "      repository, or '-' to read from standard input.\n"
+                   "      A file that is mostly http(s) URLs is treated as a list\n"
+                   "      of targets: every URL in it is fetched and scanned.\n"
                    "      --history   also walks every commit in the history.\n"
                    "      --baseline  hides secrets already seen in a saved scan.\n"
                    "      --verify    live-checks each credential with its issuer."),
         "options": ("--history --baseline --only --min-severity --min-entropy\n"
                     "      --no-entropy --no-redact --no-decode --no-archives\n"
                     "      --max-size-mb --max-commits --since --until --threads\n"
-                    "      --verify --fail-on -e/--export -o/--out --name -q"),
+                    "      --url-list --no-url-list --timeout --crawl --max-assets\n"
+                    "      --recon --max-urls --verify --fail-on\n"
+                    "      -e/--export -o/--out --name -q"),
+    },
+    "urls": {
+        "usage": "urls LIST",
+        "summary": "Scan every URL listed in a file, concurrently.",
+        "detail": ("LIST holds one http(s) URL per line. Each target is\n"
+                   "      fetched and scanned exactly the way `url` scans one\n"
+                   "      site: page, inline scripts, JS/CSS assets and an\n"
+                   "      optional crawl. Thousands of targets are visited in\n"
+                   "      parallel and every one of them is counted, whether\n"
+                   "      it answered or not.\n"
+                   "      --recon    probe sensitive paths on every target."),
+        "options": ("--threads --timeout --crawl --max-assets --recon\n"
+                    "      --max-urls --only --min-severity --min-entropy\n"
+                    "      --no-entropy --no-redact --verify --fail-on\n"
+                    "      -e/--export -o/--out --name -q"),
     },
     "url": {
         "usage": "url URL",
@@ -2709,6 +3050,8 @@ HELP_GROUPS: List[Tuple[str, List[Tuple[str, str]]]] = [
         ("url URL", "scan one website: page, JS/CSS assets, recon"),
         ("url URL --crawl 5", "also follow 5 same-host pages"),
         ("url URL --no-recon", "skip the sensitive-path probes"),
+        ("urls LIST", "scan every URL in a file, concurrently"),
+        ("scan LIST.txt", "a .txt of URLs is scanned target by target"),
     ]),
     ("VERIFY", [
         ("verify NAME", "live-check the credentials in a saved scan"),
@@ -2785,6 +3128,7 @@ def print_help(topic: Optional[str] = None) -> None:
 
     print(f"  {B}{W}EXAMPLES{X}")
     print(f"    {C}secret_sniper.py url https://target.tld --crawl 3 --verify{X}")
+    print(f"    {C}secret_sniper.py urls targets.txt -t 32 --fail-on CRITICAL{X}")
     print(f"    {C}secret_sniper.py scan ./repo --history --fail-on CRITICAL{X}")
     print(f"    {C}secret_sniper.py scan . -e sarif -o out.sarif{X}")
     print(f"    {C}secret_sniper.py export mysite -f html -o report.html{X}\n")
@@ -2934,7 +3278,10 @@ def _run_scan(target: str, history: bool = False, threads: int = 8,
               verbose: bool = True, decode_encoded: bool = True,
               follow_archives: bool = True,
               baseline: Optional[str] = None,
-              min_entropy: float = 4.2) -> Optional[Dict]:
+              min_entropy: float = 4.2,
+              url_list: str = "auto", url_timeout: int = 15,
+              url_crawl: int = 0, url_max_assets: int = 25,
+              url_recon: bool = False, max_urls: int = 0) -> Optional[Dict]:
     started = now_iso()
     begin = time.time()
 
@@ -2966,6 +3313,8 @@ def _run_scan(target: str, history: bool = False, threads: int = 8,
     commits_scanned = 0
     all_findings: List[Dict] = []
     raw_values: Dict[Tuple[str, str], str] = {}
+    bulk_stats: Dict[str, Any] = {}
+    report_kind = kind
 
     if kind == "stdin":
         if verbose:
@@ -2979,7 +3328,8 @@ def _run_scan(target: str, history: bool = False, threads: int = 8,
 
     elif kind == "file":
         ext = os.path.splitext(target)[1].lower()
-        if follow_archives and ext in ARCHIVE_EXTS:
+        is_archive = follow_archives and ext in ARCHIVE_EXTS
+        if is_archive:
             all_findings = scanner.scan_archive(target)
         else:
             all_findings = scanner.scan_file(target,
@@ -2987,6 +3337,29 @@ def _run_scan(target: str, history: bool = False, threads: int = 8,
         files_scanned = 1
         if verbose:
             print(f"  {G}v{X} scanned · {len(all_findings)} hits")
+
+        # A .txt holding thousands of URLs is a list of *targets*, not a file
+        # to grep. Scan the list itself and then every target it points at,
+        # so a 9000-URL list reports what those sites really expose.
+        if url_list != "off" and not is_archive:
+            list_text = _read_text_file(target, max_size_mb * 1024 * 1024)
+            detected = bool(list_text) and looks_like_url_list(list_text)
+            if list_text and (detected or url_list == "on"):
+                urls = extract_urls(list_text)
+                if max_urls and len(urls) > max_urls:
+                    urls = urls[:max_urls]
+                if urls:
+                    if verbose:
+                        print(f"\n{C}>>{X} URL list · {len(urls)} target(s)"
+                              f" {GR}· scanning every target{X}\n")
+                    bulk = scan_url_list(urls, scanner, threads=threads,
+                                         timeout=url_timeout, crawl=url_crawl,
+                                         max_assets=url_max_assets,
+                                         recon=url_recon, verbose=verbose)
+                    all_findings.extend(bulk["findings"])
+                    files_scanned += bulk["targets_unique"]
+                    bulk_stats = bulk
+                    report_kind = "url-list"
 
     else:
         files = walk_files(target, follow_archives=follow_archives)
@@ -3038,7 +3411,7 @@ def _run_scan(target: str, history: bool = False, threads: int = 8,
         "tool_version": TOOL_VERSION,
         "author": AUTHOR_NAME,
         "target": target,
-        "kind": kind,
+        "kind": report_kind,
         "started": started,
         "finished": now_iso(),
         "duration_ms": duration,
@@ -3054,10 +3427,23 @@ def _run_scan(target: str, history: bool = False, threads: int = 8,
             "decode_encoded": decode_encoded,
             "follow_archives": follow_archives,
             "min_entropy": min_entropy,
+            "url_list": url_list,
+            "timeout": url_timeout,
+            "crawl": url_crawl,
+            "max_assets": url_max_assets,
+            "recon": url_recon,
+            "max_urls": max_urls,
         },
         "findings": all_findings,
         "summary": _build_summary(all_findings),
     }
+
+    if bulk_stats:
+        report["targets_total"] = bulk_stats["targets_total"]
+        report["targets_unique"] = bulk_stats["targets_unique"]
+        report["targets_ok"] = bulk_stats["targets_ok"]
+        report["targets_failed"] = bulk_stats["targets_failed"]
+        report["sources"] = bulk_stats["sources"]
 
     path = _save_report(report)
     if verbose:
@@ -3087,6 +3473,13 @@ def cmd_scan(args: argparse.Namespace) -> Optional[Dict]:
         follow_archives=not args.no_archives,
         baseline=args.baseline,
         min_entropy=args.min_entropy,
+        url_list=("off" if args.no_url_list else
+                  "on" if args.url_list else "auto"),
+        url_timeout=args.timeout,
+        url_crawl=args.crawl,
+        url_max_assets=args.max_assets,
+        url_recon=args.recon,
+        max_urls=args.max_urls,
     )
     if not report:
         footer()
@@ -3234,6 +3627,12 @@ def cmd_verify(args: argparse.Namespace) -> None:
         decode_encoded=options.get("decode_encoded", True),
         follow_archives=options.get("follow_archives", True),
         min_entropy=options.get("min_entropy", 4.2),
+        url_list=options.get("url_list", "auto"),
+        url_timeout=options.get("timeout", 15),
+        url_crawl=options.get("crawl", 0),
+        url_max_assets=options.get("max_assets", 25),
+        url_recon=options.get("recon", False),
+        max_urls=options.get("max_urls", 0),
     )
     if not fresh:
         footer()
@@ -3464,6 +3863,77 @@ SELFTEST_SHAPE_CHECKS: List[Tuple[str, Callable[[], Any]]] = [
 ]
 
 
+# ── bulk URL-list scanning ───────────────────────────────────────────
+# A .txt file holding thousands of URLs must be treated as a list of
+# *targets* to visit, not as a file whose text happens to contain secrets.
+# These checks pin down the list parser and the scanner's behaviour when
+# many workers share a single instance.
+def _depth_is_thread_local() -> bool:
+    """The recursion guard must be per-thread, not per-scanner.
+
+    A shared guard lets one worker's encoded-payload scan suppress every
+    other worker's encoded-secret detection, which silently under-reports.
+    """
+    scanner = SecretScanner(redact_mode=True)
+    seen: Dict[str, Any] = {}
+
+    def worker() -> None:
+        scanner._depth = 7
+        seen["value"] = scanner._depth
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join(timeout=10)
+    return seen.get("value") == 7 and scanner._depth == 0
+
+
+def _concurrent_encoded_scan() -> bool:
+    """Two workers sharing one scanner must both detect an encoded secret."""
+    secret = "sk_" + "live_" + "51H8xYz" + "abcdefghij" + "klmnop"
+    blob = base64.b64encode(secret.encode()).decode("ascii")
+    scanner = SecretScanner(redact_mode=True)
+    barrier = threading.Barrier(2)
+    counts: List[int] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        barrier.wait(timeout=10)
+        hits = [f for f in scanner.scan_text('data = "' + blob + '"',
+                                             source="<selftest>")
+                if f["pattern"].startswith("Encoded Secret")]
+        with lock:
+            counts.append(len(hits))
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+    return len(counts) == 2 and all(count > 0 for count in counts)
+
+
+SELFTEST_BULK_CHECKS: List[Tuple[str, Callable[[], Any]]] = [
+    ("extract-urls", lambda: extract_urls(
+        "http://a.example/x\nhttps://b.example/y\n")
+     == ["http://a.example/x", "https://b.example/y"]),
+    ("extract-urls-skips-comments", lambda: extract_urls(
+        "# a comment\n\nhttp://a.example/x\n") == ["http://a.example/x"]),
+    ("extract-urls-skips-non-http", lambda: extract_urls(
+        "ftp://a.example/x\nfile:///etc/passwd\nhttp://a.example/y\n")
+     == ["http://a.example/y"]),
+    ("url-list-detected", lambda: looks_like_url_list(
+        "".join("http://host" + str(i) + ".example/page\n" for i in range(8)))
+     is True),
+    ("secret-file-not-a-url-list", lambda: looks_like_url_list(
+        ("STRIPE_KEY=" + "sk_" + "live_" + "abc\n"
+         + "GITHUB_TOKEN=" + "ghp_" + "abcdefghij\n") * 8) is False),
+    ("few-urls-not-a-url-list", lambda: looks_like_url_list(
+        "http://a.example/x\nhttp://b.example/y\n") is False),
+    ("depth-is-thread-local", _depth_is_thread_local),
+    ("concurrent-encoded-scan", _concurrent_encoded_scan),
+]
+
+
 def cmd_selftest(args: argparse.Namespace) -> int:
     """Validate the detection engine against known positive/negative samples."""
     scanner = SecretScanner(redact_mode=True, entropy=False, min_severity="LOW")
@@ -3559,9 +4029,25 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             failed.append(f"shape[{label}]{detail}")
             print(f"    {R}FAIL{X} [{label:<28}]{detail}")
 
+    print(f"\n  {W}Bulk URL-list scanning and concurrency:{X}")
+    for label, check in SELFTEST_BULK_CHECKS:
+        detail = ""
+        try:
+            ok = bool(check())
+        except Exception as exc:
+            ok = False
+            detail = f"  [{type(exc).__name__}]"
+        if ok:
+            passed += 1
+            print(f"    {G}PASS{X} [{label:<28}]")
+        else:
+            failed.append(f"bulk[{label}]{detail}")
+            print(f"    {R}FAIL{X} [{label:<28}]{detail}")
+
     total = (len(SELFTEST_POSITIVES) + len(SELFTEST_NEGATIVES)
              + len(SELFTEST_BODY_CHECKS) + len(SELFTEST_VERDICT_CHECKS)
-             + len(SELFTEST_IDENTIFIER_CHECKS) + len(SELFTEST_SHAPE_CHECKS))
+             + len(SELFTEST_IDENTIFIER_CHECKS) + len(SELFTEST_SHAPE_CHECKS)
+             + len(SELFTEST_BULK_CHECKS))
     print()
     print(f"{R}{'=' * 64}{X}")
     if failed:
@@ -3605,21 +4091,25 @@ def interactive() -> None:
             if not target:
                 continue
             cmd_scan(argparse.Namespace(
-                target=target, history=(choice == "4"), threads=8,
+                target=target, history=(choice == "4"), threads=20,
                 max_size_mb=5, only=None, min_severity="LOW",
                 no_entropy=False, no_redact=False, max_commits=0,
                 since=None, until=None, name=None, export=None, out=None,
                 quiet=False, no_decode=False, no_archives=False,
                 baseline=None, verify=False, min_entropy=4.2, fail_on=None,
+                url_list=False, no_url_list=False, timeout=15, crawl=0,
+                max_assets=25, recon=False, max_urls=0,
             ))
         elif choice == "5":
             cmd_scan(argparse.Namespace(
-                target="-", history=False, threads=8, max_size_mb=5,
+                target="-", history=False, threads=20, max_size_mb=5,
                 only=None, min_severity="LOW", no_entropy=False,
                 no_redact=False, max_commits=0, since=None, until=None,
                 name=None, export=None, out=None, quiet=False,
                 no_decode=False, no_archives=False, baseline=None,
                 verify=False, min_entropy=4.2, fail_on=None,
+                url_list=False, no_url_list=False, timeout=15, crawl=0,
+                max_assets=25, recon=False, max_urls=0,
             ))
         elif choice == "6":
             name = input(f"{W}Scan name: {X}").strip()
@@ -3704,10 +4194,24 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("target", help="path, git repo, archive, or '-' for stdin")
     scan.add_argument("--history", action="store_true",
                       help="include full git history (repo only)")
-    scan.add_argument("-t", "--threads", type=int, default=8,
-                      help="worker threads (default 8)")
+    scan.add_argument("-t", "--threads", type=int, default=20,
+                      help="worker threads (default 20)")
     scan.add_argument("--max-size-mb", type=int, default=5,
                       help="skip files larger than N MB (default 5)")
+    scan.add_argument("--url-list", action="store_true",
+                      help="treat the file as a list of URLs and scan every target")
+    scan.add_argument("--no-url-list", action="store_true",
+                      help="never treat a file as a URL list (plain file scan only)")
+    scan.add_argument("--timeout", type=int, default=15,
+                      help="per-request timeout for URL-list scans (default 15)")
+    scan.add_argument("--crawl", type=int, default=0,
+                      help="also follow N same-host pages per URL-list target")
+    scan.add_argument("--max-assets", type=int, default=25,
+                      help="maximum JS/CSS assets per URL-list target (default 25)")
+    scan.add_argument("--recon", action="store_true",
+                      help="probe sensitive paths on every URL-list target")
+    scan.add_argument("--max-urls", type=int, default=0,
+                      help="scan at most N targets from a URL list (0 = all)")
     scan.add_argument("--only", default=None,
                       help="comma-separated categories: aws,github,stripe,openai,"
                            "discord,jwt,private-key,database,generic,entropy,encoded,...")
@@ -3778,6 +4282,46 @@ def build_parser() -> argparse.ArgumentParser:
     url.add_argument("-o", "--out", default=None, help="export output file")
     url.add_argument("-q", "--quiet", action="store_true")
 
+    urls_cmd = sub.add_parser("urls",
+                              help="scan every URL listed in a file")
+    urls_cmd.add_argument("list_file",
+                          help="file holding one http(s) URL per line")
+    urls_cmd.add_argument("-t", "--threads", type=int, default=20,
+                          help="worker threads (default 20)")
+    urls_cmd.add_argument("--timeout", type=int, default=10,
+                          help="per-request timeout in seconds (default 10)")
+    urls_cmd.add_argument("--crawl", type=int, default=0,
+                          help="also follow N same-host pages per target (default 0)")
+    urls_cmd.add_argument("--max-assets", type=int, default=25,
+                          help="maximum JS/CSS assets per target (default 25)")
+    urls_cmd.add_argument("--recon", action="store_true",
+                          help="probe sensitive paths on every target "
+                               "(8 extra requests each)")
+    urls_cmd.add_argument("--max-urls", type=int, default=0,
+                          help="scan at most N targets (0 = all)")
+    urls_cmd.add_argument("--only", default=None,
+                          help="comma-separated categories: aws,github,stripe,openai,"
+                               "discord,jwt,private-key,database,generic,entropy,...")
+    urls_cmd.add_argument("--min-severity", default="LOW",
+                          choices=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"])
+    urls_cmd.add_argument("--no-entropy", action="store_true",
+                          help="disable entropy-based detection")
+    urls_cmd.add_argument("--no-redact", action="store_true",
+                          help="show raw secret values (careful!)")
+    urls_cmd.add_argument("--min-entropy", type=float, default=4.2,
+                          help="entropy threshold for generic detection (default 4.2)")
+    urls_cmd.add_argument("--name", default=None, help="save scan under this name")
+    urls_cmd.add_argument("--verify", action="store_true",
+                          help="live-check detected credentials against their provider")
+    urls_cmd.add_argument("--fail-on", default=None,
+                          choices=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"],
+                          help="exit with code 1 when a finding reaches this severity")
+    urls_cmd.add_argument("-e", "--export", default=None,
+                          choices=["sarif", "json", "csv", "html"],
+                          help="also export in this format")
+    urls_cmd.add_argument("-o", "--out", default=None, help="export output file")
+    urls_cmd.add_argument("-q", "--quiet", action="store_true")
+
     export = sub.add_parser("export", help="export a saved scan")
     export.add_argument("name")
     export.add_argument("-f", "--format", default="sarif",
@@ -3847,6 +4391,8 @@ def main() -> int:
             cmd_scan(args)
         elif args.cmd == "url":
             cmd_url(args)
+        elif args.cmd == "urls":
+            cmd_urls(args)
         elif args.cmd == "export":
             cmd_export(args)
         elif args.cmd == "list":
